@@ -459,10 +459,40 @@ def ensure_tools() -> None:
 
 
 def ensure_product(product: str) -> None:
-    if find_tool_path(product) is not None:
+    if product_is_current(product):
         return
     print(f"building Swift product: {product}", file=sys.stderr)
-    run_command(["swift", "build", "--product", product], timeout=120)
+    try:
+        run_command(["swift", "build", "--product", product], timeout=120)
+    except subprocess.CalledProcessError as exc:
+        output = f"{exc.stdout or ''}\n{exc.stderr or ''}"
+        if "no_warn_duplicate_libraries" not in output:
+            raise
+        print(
+            "warning: default Swift toolchain emitted an unsupported linker flag; retrying with Xcode default toolchain",
+            file=sys.stderr,
+        )
+        env = dict(os.environ)
+        env["TOOLCHAINS"] = "com.apple.dt.toolchain.XcodeDefault"
+        subprocess.run(
+            [
+                "xcrun",
+                "swift",
+                "build",
+                "--scratch-path",
+                os.fspath(fallback_scratch_path()),
+                "--product",
+                product,
+            ],
+            cwd=REPO_ROOT,
+            text=True,
+            encoding="utf-8",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+            timeout=120,
+            env=env,
+        )
 
 
 def find_tool_path(name: str) -> Path | None:
@@ -473,7 +503,25 @@ def find_tool_path(name: str) -> Path | None:
             return core_path
 
     path = DEBUG_DIR / name
-    return path if path.exists() else None
+    fallback_path = fallback_scratch_path() / "debug" / name
+    existing = [candidate for candidate in (path, fallback_path) if candidate.exists()]
+    if not existing:
+        return None
+    return max(existing, key=lambda candidate: candidate.stat().st_mtime)
+
+
+def fallback_scratch_path() -> Path:
+    return Path("/tmp") / f"tactile-macos-swift-{safe_path_component(os.fspath(SWIFT_PACKAGE_ROOT))}"
+
+
+def latest_swift_source_mtime() -> float:
+    candidates = [SWIFT_PACKAGE_ROOT / "Package.swift", *(SWIFT_PACKAGE_ROOT / "Sources").rglob("*.swift")]
+    return max((path.stat().st_mtime for path in candidates if path.exists()), default=0.0)
+
+
+def product_is_current(product: str) -> bool:
+    path = find_tool_path(product)
+    return path is not None and path.stat().st_mtime >= latest_swift_source_mtime()
 
 
 def tool_path(name: str) -> str:

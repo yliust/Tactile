@@ -30,6 +30,70 @@ internal func primaryScreenTopY() -> CGFloat {
     return 0
 }
 
+internal func appKitFrameFromTopLeftScreenRect(
+    _ rect: CGRect,
+    displayTopLeftBounds: CGRect,
+    appKitScreenFrame: NSRect
+) -> NSRect {
+    NSRect(
+        x: appKitScreenFrame.minX + (rect.minX - displayTopLeftBounds.minX),
+        y: appKitScreenFrame.maxY - (rect.minY - displayTopLeftBounds.minY) - rect.height,
+        width: rect.width,
+        height: rect.height
+    )
+}
+
+internal func screenNumber(_ screen: NSScreen) -> CGDirectDisplayID? {
+    if let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID {
+        return id
+    }
+    if let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber {
+        return CGDirectDisplayID(number.uint32Value)
+    }
+    return nil
+}
+
+internal func appKitScreenFrame(forDisplay displayID: CGDirectDisplayID) -> NSRect? {
+    for screen in NSScreen.screens {
+        if screenNumber(screen) == displayID {
+            return screen.frame
+        }
+    }
+    return nil
+}
+
+internal func displayBridgeFrame(containing point: CGPoint) -> (displayBounds: CGRect, screenFrame: NSRect)? {
+    var count: UInt32 = 0
+    guard CGGetActiveDisplayList(0, nil, &count) == .success, count > 0 else {
+        return nil
+    }
+    var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
+    guard CGGetActiveDisplayList(count, &displays, &count) == .success else {
+        return nil
+    }
+
+    var fallback: (displayBounds: CGRect, screenFrame: NSRect)?
+    var fallbackDistance = CGFloat.greatestFiniteMagnitude
+    for displayID in displays {
+        let bounds = CGDisplayBounds(displayID)
+        guard let screenFrame = appKitScreenFrame(forDisplay: displayID) else { continue }
+        if bounds.contains(point) {
+            return (bounds, screenFrame)
+        }
+
+        let clampedX = min(max(point.x, bounds.minX), bounds.maxX)
+        let clampedY = min(max(point.y, bounds.minY), bounds.maxY)
+        let dx = point.x - clampedX
+        let dy = point.y - clampedY
+        let distance = dx * dx + dy * dy
+        if distance < fallbackDistance {
+            fallbackDistance = distance
+            fallback = (bounds, screenFrame)
+        }
+    }
+    return fallback
+}
+
 internal func appKitFrameFromTopLeftScreenRect(_ rect: CGRect, primaryTopY: CGFloat = primaryScreenTopY()) -> NSRect {
     NSRect(
         x: rect.origin.x,
