@@ -46,6 +46,21 @@ https://github.com/user-attachments/assets/7bc0f05e-9228-4cf1-abe3-ffb7e4722be2
 
 ## How to Use Tactile
 
+### Prefer the macOS MCP
+
+For macOS, you can use the dedicated Tactile MCP in
+`mcps/tactile-macos-mcp`. It is the recommended entry point when available:
+it is faster, easier to use, and exposes Tactile's accessibility-first workflow
+directly through MCP tools.
+
+Use the MCP server with:
+
+```bash
+mcps/tactile-macos-mcp/bin/tactile-macos-mcp
+```
+
+### Use Tactile as a skill
+
 Ask your agent to configure this skill from the repository:
 
 ```txt
@@ -59,13 +74,6 @@ export TACTILE_OPENAI_BASE_URL=xxxxxxx
 export TACTILE_OPENAI_API_KEY=xxxxxxx
 export TACTILE_MODEL='gpt-5.5'
 ```
-
-
-## macOS MCP
-
-We have added a dedicated Tactile MCP for macOS in `mcps/tactile-macos-mcp`.
-It provides a faster and easier-to-use MCP interface for operating macOS apps
-through Tactile's accessibility-first workflow.
 
 
 ## Why Tactile?
