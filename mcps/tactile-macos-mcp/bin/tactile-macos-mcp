@@ -1,0 +1,20 @@
+#!/bin/bash
+set -euo pipefail
+
+SOURCE="$0"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+
+ROOT="$(cd "$(dirname "$SOURCE")/.." && pwd)"
+BINARY="$ROOT/.build/release/tactile-macos-mcp"
+
+if [ ! -x "$BINARY" ]; then
+  echo "Binary not found. Building tactile-macos-mcp..." >&2
+  (cd "$ROOT" && xcrun swift build -c release -Xswiftc -swift-version -Xswiftc 5 -Xswiftc -use-ld="$ROOT/scripts/ld-wrapper/ld" >&2)
+fi
+
+export TACTILE_MACOS_MCP_ROOT="$ROOT"
+exec "$BINARY" "$@"

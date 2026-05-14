@@ -137,6 +137,21 @@ fileprivate func axFrame(of element: AXUIElement) -> CGRect? {
     return CGRect(origin: origin, size: size)
 }
 
+fileprivate func axCenter(of element: AXUIElement) -> CGPoint? {
+    guard let frame = axFrame(of: element), frame.width > 0, frame.height > 0 else {
+        return nil
+    }
+    return CGPoint(x: frame.midX, y: frame.midY)
+}
+
+fileprivate func prepareVirtualCursorForAXPress(_ element: AXUIElement, fallback point: CGPoint? = nil) {
+    if let center = axCenter(of: element) {
+        prepareVirtualCursorAXPress(at: center)
+    } else if let point {
+        prepareVirtualCursorAXPress(at: point)
+    }
+}
+
 // Walks the application's AX tree breadth-first looking for the smallest
 // element whose frame contains `point` and whose role is in `preferredRoles`
 // (when provided). Falls back to the smallest containing element of any role.
@@ -302,6 +317,7 @@ public func pressAccessibilityElement(pid: Int32, at point: CGPoint) throws {
     }
     let targetRole = axRole(of: element) ?? "<unknown>"
     fputs("log: AX press target role=\(targetRole)\n", stderr)
+    prepareVirtualCursorForAXPress(element, fallback: point)
     let err = AXUIElementPerformAction(element, kAXPressAction as CFString)
     guard err == .success else {
         throw MacosUseSDKError.inputSimulationFailed(
@@ -317,6 +333,7 @@ public func pressAccessibilityElement(pid: Int32, atPath path: String) throws {
     fputs("log: AX press at path \(path) for pid \(pid)\n", stderr)
     let element = try axElement(pid: pid, atPath: path)
     let targetRole = axRole(of: element) ?? "<unknown>"
+    prepareVirtualCursorForAXPress(element)
     let err = axPerformPress(element)
     guard err == .success else {
         let actions = axSupportedActions(of: element).joined(separator: ",")
@@ -348,6 +365,7 @@ public func activateAccessibilityElement(pid: Int32, atPath path: String) throws
     fputs("log: AX activate at path \(path) for pid \(pid)\n", stderr)
     let element = try axElement(pid: pid, atPath: path)
     let targetRole = axRole(of: element) ?? "<unknown>"
+    prepareVirtualCursorForAXPress(element)
 
     if isTextInputRole(targetRole) {
         let focusErr = axSetFocused(element)

@@ -26,6 +26,9 @@ let package = Package(
             name: "VisualInputTool",
             targets: ["VisualInputTool"]),
         .executable(
+            name: "VirtualCursorTool",
+            targets: ["VirtualCursorTool"]),
+        .executable(
             name: "AppOpenerTool",
             targets: ["AppOpenerTool"]),
         .executable(
@@ -65,6 +68,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "VisualInputTool",
+            dependencies: ["MacosUseSDK"]
+        ),
+        .executableTarget(
+            name: "VirtualCursorTool",
             dependencies: ["MacosUseSDK"]
         ),
         .executableTarget(

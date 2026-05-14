@@ -1,6 +1,7 @@
 # SwiftPM build and local workspace state
 .build/
 .swiftpm/
+.state/
 
 # Python caches from incidental helper execution
 __pycache__/

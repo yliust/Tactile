@@ -60,8 +60,9 @@ SECTION_ALIASES = {
     "飞行社": "飞行社",
 }
 
-DEFAULT_WAIT_MS = 100
-DEFAULT_SWITCH_WAIT_MS = 120
+DEFAULT_WAIT_MS = 1000
+DEFAULT_SWITCH_WAIT_MS = 1000
+MIN_UI_ACTION_INTERVAL_SECONDS = 1.0
 MIN_WAIT_SECONDS = 0.01
 
 
@@ -88,7 +89,7 @@ def attach_trace(payload: dict[str, Any], *, command: str) -> dict[str, Any]:
 
 def wait_seconds(args: Any, *, default_ms: int = DEFAULT_WAIT_MS) -> float:
     wait_ms = getattr(args, "wait_ms", default_ms)
-    return max(float(wait_ms) / 1000.0, MIN_WAIT_SECONDS)
+    return max(float(wait_ms) / 1000.0, MIN_UI_ACTION_INTERVAL_SECONDS)
 
 
 def utf8_env() -> dict[str, str]:
@@ -131,6 +132,9 @@ class FastContext:
             self.product_cache[name] = os.fspath(self.debug_tool(self.repo, name))
         return self.product_cache[name]
 
+    def sleep_after_ui_action(self, delay: float | None) -> None:
+        time.sleep(max(float(delay or 0), MIN_UI_ACTION_INTERVAL_SECONDS))
+
     def run(
         self,
         cmd: list[str],
@@ -165,6 +169,7 @@ class FastContext:
                 raw = proc.stdout.strip()
                 try:
                     pid = int(raw)
+                    self.sleep_after_ui_action(MIN_UI_ACTION_INTERVAL_SECONDS)
                     return pid, {"target": candidate, "pid": pid}
                 except ValueError:
                     errors.append({"target": candidate, "error": f"unexpected pid output: {raw}"})
@@ -184,28 +189,27 @@ class FastContext:
 
     def keypress(self, key: str, *, delay: float = 0.08) -> dict[str, Any]:
         proc = self.run([self.input_tool(), "keypress", key], timeout=10)
-        if delay > 0:
-            time.sleep(delay)
+        self.sleep_after_ui_action(delay)
         return {"key": key, "stderr": proc.stderr[-500:]}
 
     def click_center(self, element: dict[str, Any], *, delay: float = 0.1) -> dict[str, Any]:
         x = float(element.get("x") or 0) + (float(element.get("width") or 0) / 2.0)
         y = float(element.get("y") or 0) + (float(element.get("height") or 0) / 2.0)
         proc = self.run([self.input_tool(), "click", f"{x:.1f}", f"{y:.1f}"], timeout=10)
-        if delay > 0:
-            time.sleep(delay)
+        self.sleep_after_ui_action(delay)
         return {"action": "click", "element": compact_element(element), "point": {"x": x, "y": y}, "stderr": proc.stderr[-500:]}
 
     def ax_action(self, pid: int, element: dict[str, Any], *, delay: float = 0.1) -> dict[str, Any]:
         ax_path = element.get("axPath") or element.get("ax_path")
         if not ax_path:
             raise RuntimeError(f"element has no AX path: {compact_element(element)}")
+        if os.getenv("TACTILE_VIRTUAL_CURSOR_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}:
+            self.product("VirtualCursorTool")
         errors: list[str] = []
         for action in ("axactivate", "axpress", "axselect", "axfocus"):
             proc = self.run([self.input_tool(), action, str(pid), str(ax_path)], timeout=10, check=False)
+            self.sleep_after_ui_action(delay)
             if proc.returncode == 0:
-                if delay > 0:
-                    time.sleep(delay)
                 return {"action": action, "element": compact_element(element), "stderr": proc.stderr[-500:]}
             errors.append((proc.stderr or proc.stdout or "").strip()[-500:])
         raise RuntimeError(f"AX action failed for {compact_element(element)}: {errors}")
@@ -215,8 +219,7 @@ class FastContext:
         if not ax_path:
             raise RuntimeError(f"element has no AX path: {compact_element(element)}")
         proc = self.run([self.input_tool(), "axfocus", str(pid), str(ax_path)], timeout=10)
-        if delay > 0:
-            time.sleep(delay)
+        self.sleep_after_ui_action(delay)
         return {"action": "axfocus", "element": compact_element(element), "stderr": proc.stderr[-500:]}
 
     def paste_text(

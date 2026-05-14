@@ -1,0 +1,13 @@
+#!/bin/bash
+set -euo pipefail
+
+REAL_LD="${TACTILE_MACOS_MCP_REAL_LD:-/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld}"
+
+filtered=()
+for arg in "$@"; do
+  if [[ "$arg" != "-no_warn_duplicate_libraries" ]]; then
+    filtered+=("$arg")
+  fi
+done
+
+exec "$REAL_LD" "${filtered[@]}"

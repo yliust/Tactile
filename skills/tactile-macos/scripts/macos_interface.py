@@ -6,9 +6,12 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import math
 import os
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -29,11 +32,17 @@ ALL_PRODUCTS = (
     "HighlightTraversalTool",
     "InputControllerTool",
     "VisualInputTool",
+    "VirtualCursorTool",
 )
 CORE_TOOL_DIR_ENV = "TACTILE_MACOS_TOOL_DIR"
 DEBUG_AX_GRID_ENV = "TACTILE_DEBUG_AX_GRID"
 DEBUG_AX_GRID_DURATION_ENV = "TACTILE_DEBUG_AX_GRID_DURATION"
 DEFAULT_DEBUG_AX_GRID_DURATION = 1.5
+CURSOR_CLICK_PRE_EFFECT_SECONDS = 0.08
+CURSOR_SETTLE_WHEN_HIDDEN_SECONDS = 0.72
+CURSOR_SETTLE_MIN_SECONDS = 0.10
+CURSOR_SETTLE_MAX_SECONDS = 1.05
+CURSOR_MOTION_BASE_SECONDS = 1.280 / 1.45
 ARTIFACT_SUBDIR = artifact_utils.ARTIFACT_SUBDIR
 default_artifact_path = artifact_utils.default_artifact_path
 find_workspace_root = artifact_utils.find_workspace_root
@@ -225,16 +234,264 @@ def core_tool(product: str) -> Path | None:
     return None
 
 
+def fallback_scratch_path(repo: Path) -> Path:
+    return Path("/tmp") / f"tactile-macos-swift-{safe_path_component(os.fspath(repo))}"
+
+
+def newest_existing_path(paths: list[Path]) -> Path | None:
+    existing = [path for path in paths if path.exists()]
+    if not existing:
+        return None
+    return max(existing, key=lambda path: path.stat().st_mtime)
+
+
 def debug_tool(repo: Path, product: str) -> Path:
-    return core_tool(product) or repo / ".build" / "debug" / product
+    configured = core_tool(product)
+    if configured is not None:
+        return configured
+    default_path = repo / ".build" / "debug" / product
+    fallback_path = fallback_scratch_path(repo) / "debug" / product
+    if newest := newest_existing_path([default_path, fallback_path]):
+        return newest
+    return default_path
+
+
+def latest_swift_source_mtime(repo: Path) -> float:
+    candidates = [repo / "Package.swift", *(repo / "Sources").rglob("*.swift")]
+    return max((path.stat().st_mtime for path in candidates if path.exists()), default=0.0)
+
+
+def product_is_current(repo: Path, product: str) -> bool:
+    path = debug_tool(repo, product)
+    return path.exists() and path.stat().st_mtime >= latest_swift_source_mtime(repo)
+
+
+def state_dir(repo: Path) -> Path:
+    return repo / ".state"
+
+
+def cursor_state_path(repo: Path) -> Path:
+    return state_dir(repo) / "virtual-cursor.json"
+
+
+def cursor_pid_path(repo: Path) -> Path:
+    return state_dir(repo) / "virtual-cursor.pid"
+
+
+def cursor_build_stamp_path(repo: Path) -> Path:
+    return state_dir(repo) / "virtual-cursor.buildstamp"
+
+
+def ensure_state_dirs(repo: Path) -> None:
+    state_dir(repo).mkdir(parents=True, exist_ok=True)
+
+
+def write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def read_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_cursor_state(
+    repo: Path,
+    point: dict[str, float] | None,
+    *,
+    event: str = "idle",
+    label: str | None = None,
+    visible: bool = True,
+) -> None:
+    write_json(
+        cursor_state_path(repo),
+        {
+            "visible": visible,
+            "point": point or {"x": 0.0, "y": 0.0},
+            "event": event,
+            "label": label,
+            "updatedAt": time.time(),
+        },
+    )
+
+
+def read_cursor_pid(repo: Path) -> int | None:
+    try:
+        return int(cursor_pid_path(repo).read_text(encoding="utf-8").strip())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def write_cursor_pid(repo: Path, pid: int) -> None:
+    ensure_state_dirs(repo)
+    cursor_pid_path(repo).write_text(f"{pid}\n", encoding="utf-8")
+
+
+def clear_cursor_pid(repo: Path) -> None:
+    try:
+        cursor_pid_path(repo).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def read_cursor_build_stamp(repo: Path) -> str | None:
+    try:
+        return cursor_build_stamp_path(repo).read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+
+
+def write_cursor_build_stamp(repo: Path, stamp: str) -> None:
+    ensure_state_dirs(repo)
+    cursor_build_stamp_path(repo).write_text(f"{stamp}\n", encoding="utf-8")
+
+
+def clear_cursor_build_stamp(repo: Path) -> None:
+    try:
+        cursor_build_stamp_path(repo).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def stop_pid(pid: int) -> bool:
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except OSError:
+        return False
+
+
+def ensure_cursor_process(repo: Path) -> None:
+    ensure_products(repo, ["VirtualCursorTool"])
+    cursor_tool = debug_tool(repo, "VirtualCursorTool")
+    build_stamp = str(cursor_tool.stat().st_mtime_ns)
+    pid = read_cursor_pid(repo)
+    if pid and pid_is_alive(pid) and read_cursor_build_stamp(repo) == build_stamp:
+        return
+    if pid and pid_is_alive(pid):
+        stop_pid(pid)
+        time.sleep(0.05)
+    clear_cursor_pid(repo)
+    clear_cursor_build_stamp(repo)
+    if not cursor_state_path(repo).exists():
+        write_cursor_state(repo, {"x": 0.0, "y": 0.0}, event="idle", visible=False)
+    proc = subprocess.Popen(
+        [os.fspath(cursor_tool), os.fspath(cursor_state_path(repo))],
+        cwd=repo,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    write_cursor_pid(repo, proc.pid)
+    write_cursor_build_stamp(repo, build_stamp)
+
+
+def cursor_status_payload(repo: Path) -> dict[str, Any]:
+    pid = read_cursor_pid(repo)
+    state_payload = None
+    path = cursor_state_path(repo)
+    if path.exists():
+        try:
+            state_payload = read_json(path)
+        except (OSError, json.JSONDecodeError):
+            state_payload = None
+    return {
+        "ok": True,
+        "running": bool(pid and pid_is_alive(pid)),
+        "pid": pid,
+        "statePath": os.fspath(path),
+        "state": state_payload,
+    }
+
+
+def last_visible_cursor_point(repo: Path) -> dict[str, float] | None:
+    path = cursor_state_path(repo)
+    if not path.exists():
+        return None
+    try:
+        payload = read_json(path)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("visible") is not True:
+        return None
+    point = payload.get("point")
+    if not isinstance(point, dict):
+        return None
+    try:
+        return {"x": float(point["x"]), "y": float(point["y"])}
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def cursor_settle_delay(repo: Path, point: dict[str, float]) -> float:
+    previous = last_visible_cursor_point(repo)
+    if previous is None:
+        return CURSOR_SETTLE_WHEN_HIDDEN_SECONDS
+
+    distance = math.hypot(float(point["x"]) - previous["x"], float(point["y"]) - previous["y"])
+    if distance < 2.0:
+        return CURSOR_SETTLE_MIN_SECONDS
+
+    factor = max(0.55, min(1.80, distance / 520.0))
+    delay = max(0.42, CURSOR_MOTION_BASE_SECONDS * factor)
+    return min(max(delay, CURSOR_SETTLE_MIN_SECONDS), CURSOR_SETTLE_MAX_SECONDS)
+
+
+def prepare_cursor_click(repo: Path, point: dict[str, float], *, settle_seconds: float | None = None) -> None:
+    ensure_cursor_process(repo)
+    delay = cursor_settle_delay(repo, point) if settle_seconds is None else max(0.0, settle_seconds)
+    write_cursor_state(repo, point, event="move", visible=True)
+    time.sleep(delay)
+    write_cursor_state(repo, point, event="click", visible=True)
+    time.sleep(CURSOR_CLICK_PRE_EFFECT_SECONDS)
 
 
 def ensure_products(repo: Path, products: list[str]) -> None:
     for product in products:
-        if debug_tool(repo, product).exists():
+        if product_is_current(repo, product):
             continue
         print(f"building Swift product: {product}", file=sys.stderr)
-        run(["swift", "build", "--product", product], repo=repo, timeout=120)
+        try:
+            run(["swift", "build", "--product", product], repo=repo, capture=True, timeout=120)
+        except subprocess.CalledProcessError as exc:
+            output = f"{exc.stdout or ''}\n{exc.stderr or ''}"
+            if "no_warn_duplicate_libraries" not in output:
+                if exc.stdout:
+                    sys.stderr.write(exc.stdout)
+                if exc.stderr:
+                    sys.stderr.write(exc.stderr)
+                raise
+            print(
+                "warning: default Swift toolchain emitted an unsupported linker flag; retrying with Xcode default toolchain",
+                file=sys.stderr,
+            )
+            env = dict(os.environ)
+            env["TOOLCHAINS"] = "com.apple.dt.toolchain.XcodeDefault"
+            run(
+                [
+                    "xcrun",
+                    "swift",
+                    "build",
+                    "--scratch-path",
+                    os.fspath(fallback_scratch_path(repo)),
+                    "--product",
+                    product,
+                ],
+                repo=repo,
+                capture=True,
+                timeout=120,
+                env=env,
+            )
 
 
 def launch_debug_ax_grid(
@@ -531,7 +788,10 @@ def cmd_input(args: argparse.Namespace) -> int:
 
 def cmd_ax(args: argparse.Namespace) -> int:
     repo = repo_path(args.repo)
-    ensure_products(repo, ["InputControllerTool"])
+    products = ["InputControllerTool"]
+    if args.action in {"axactivate", "axpress"} and env_flag_enabled("TACTILE_VIRTUAL_CURSOR_ENABLED"):
+        products.append("VirtualCursorTool")
+    ensure_products(repo, products)
     if args.action == "axsetvalue" and args.value is None:
         raise SystemExit("axsetvalue requires a value argument")
     maybe_launch_debug_ax_grid(repo, args, args.pid)
@@ -552,6 +812,141 @@ def parse_region(value: str) -> tuple[float, float, float, float]:
     if width <= 0 or height <= 0:
         raise SystemExit("--region width and height must be positive")
     return x, y, width, height
+
+
+def region_move_test_waypoints(region: tuple[float, float, float, float]) -> list[dict[str, float]]:
+    x, y, width, height = region
+    pad_x = min(width * 0.18, 140.0)
+    pad_y = min(height * 0.18, 100.0)
+    left = x + pad_x
+    right = x + width - pad_x
+    top = y + pad_y
+    bottom = y + height - pad_y
+    center_x = x + width / 2.0
+    center_y = y + height / 2.0
+    return [
+        {"x": center_x, "y": center_y},
+        {"x": left, "y": top},
+        {"x": right, "y": top},
+        {"x": right, "y": bottom},
+        {"x": left, "y": bottom},
+        {"x": center_x, "y": center_y},
+    ]
+
+
+def fallback_move_test_waypoints(repo: Path) -> list[dict[str, float]]:
+    point = last_visible_cursor_point(repo) or {"x": 240.0, "y": 240.0}
+    center_x = float(point.get("x", 240.0))
+    center_y = float(point.get("y", 240.0))
+    radius = 90.0
+    return [
+        {"x": center_x, "y": center_y},
+        {"x": center_x - radius, "y": center_y - radius * 0.55},
+        {"x": center_x + radius, "y": center_y - radius * 0.55},
+        {"x": center_x + radius, "y": center_y + radius * 0.55},
+        {"x": center_x - radius, "y": center_y + radius * 0.55},
+        {"x": center_x, "y": center_y},
+    ]
+
+
+def interpolate_waypoints(waypoints: list[dict[str, float]], steps: int) -> list[dict[str, float]]:
+    if len(waypoints) < 2:
+        return waypoints
+    steps = max(2, steps)
+    segments = len(waypoints) - 1
+    points: list[dict[str, float]] = []
+    for index in range(steps):
+        progress = index / float(steps - 1)
+        segment_position = min(progress * segments, segments - 1e-9)
+        segment_index = min(int(segment_position), segments - 1)
+        local_t = segment_position - segment_index
+        start = waypoints[segment_index]
+        end = waypoints[segment_index + 1]
+        points.append(
+            {
+                "x": float(start["x"]) + (float(end["x"]) - float(start["x"])) * local_t,
+                "y": float(start["y"]) + (float(end["y"]) - float(start["y"])) * local_t,
+            }
+        )
+    points[-1] = waypoints[-1]
+    return points
+
+
+def cmd_cursor(args: argparse.Namespace) -> int:
+    repo = repo_path(args.repo)
+    ensure_state_dirs(repo)
+
+    if args.cursor_command == "status":
+        write_or_print(cursor_status_payload(repo), args.output)
+        return 0
+
+    if args.cursor_command == "start":
+        write_cursor_state(repo, {"x": 0.0, "y": 0.0}, event="idle", visible=False)
+        ensure_cursor_process(repo)
+        write_or_print(cursor_status_payload(repo), args.output)
+        return 0
+
+    if args.cursor_command == "stop":
+        pid = read_cursor_pid(repo)
+        stopped = False
+        if pid and pid_is_alive(pid):
+            stopped = stop_pid(pid)
+        clear_cursor_pid(repo)
+        clear_cursor_build_stamp(repo)
+        write_cursor_state(repo, {"x": 0.0, "y": 0.0}, event="stop", visible=False)
+        write_or_print({"ok": True, "stopped": stopped, "pid": pid}, args.output)
+        return 0
+
+    if args.cursor_command in {"move", "click"}:
+        if len(args.coords) != 2:
+            raise SystemExit(f"cursor {args.cursor_command} requires <x> <y>")
+        try:
+            point = {"x": float(args.coords[0]), "y": float(args.coords[1])}
+        except ValueError as exc:
+            raise SystemExit("cursor coordinates must be numbers") from exc
+        if args.cursor_command == "click":
+            prepare_cursor_click(repo, point, settle_seconds=args.settle_ms / 1000.0 if args.settle_ms is not None else None)
+            event = "click"
+        else:
+            ensure_cursor_process(repo)
+            event = args.event or "move"
+            write_cursor_state(repo, point, event=event, label=args.label, visible=True)
+        write_or_print({"ok": True, "action": f"cursor.{args.cursor_command}", "event": event, "point": point}, args.output)
+        return 0
+
+    if args.cursor_command in {"move_test", "move-test"}:
+        if args.duration <= 0:
+            raise SystemExit("--duration must be > 0")
+        if args.steps < 2:
+            raise SystemExit("--steps must be >= 2")
+        ensure_cursor_process(repo)
+        if args.pid is not None:
+            region = window_region_from_pid(repo, args.pid, args.window_index)
+        elif args.region is not None:
+            region = parse_region(args.region)
+        else:
+            region = None
+        waypoints = region_move_test_waypoints(region) if region else fallback_move_test_waypoints(repo)
+        points = interpolate_waypoints(waypoints, args.steps)
+        delay = args.duration / max(len(points) - 1, 1)
+        for point in points:
+            write_cursor_state(repo, point, event="move_test", visible=True)
+            time.sleep(delay)
+        write_or_print(
+            {
+                "ok": True,
+                "action": "cursor.move_test",
+                "duration": args.duration,
+                "steps": len(points),
+                "region": {"x": region[0], "y": region[1], "width": region[2], "height": region[3]} if region else None,
+                "start": points[0],
+                "end": points[-1],
+            },
+            args.output,
+        )
+        return 0
+
+    raise SystemExit(f"unsupported cursor command: {args.cursor_command}")
 
 
 def window_region_from_pid(repo: Path, pid: int, window_index: int) -> tuple[float, float, float, float]:
@@ -941,6 +1336,21 @@ def build_parser() -> argparse.ArgumentParser:
     ax.add_argument("ax_path")
     ax.add_argument("value", nargs="?")
     ax.set_defaults(func=cmd_ax)
+
+    cursor = subparsers.add_parser("cursor", help="Manage the persistent virtual cursor overlay.")
+    add_global(cursor)
+    cursor.add_argument("cursor_command", choices=["start", "stop", "status", "move", "click", "move_test", "move-test"])
+    cursor.add_argument("coords", nargs="*", help="For move/click: x y in top-left screen coordinates.")
+    cursor.add_argument("--event", default="move", help="State event name for cursor move. Defaults to move.")
+    cursor.add_argument("--label", help="Optional cursor label text.")
+    cursor.add_argument("--settle-ms", type=float, help="Click movement settle delay override in milliseconds.")
+    cursor.add_argument("--duration", type=float, default=6.0, help="Movement test duration in seconds.")
+    cursor.add_argument("--steps", type=int, default=6, help="Number of cursor target positions for move_test.")
+    cursor.add_argument("--region", help="Movement test region as x,y,width,height in top-left screen coordinates.")
+    cursor.add_argument("--pid", type=int, help="Use the visible AXWindow for this pid as the movement test region.")
+    cursor.add_argument("--window-index", type=int, default=0)
+    cursor.add_argument("--output", type=Path)
+    cursor.set_defaults(func=cmd_cursor)
 
     ocr = subparsers.add_parser("ocr", help="Run local macOS Vision OCR on an image, screen region, or app window.")
     add_global(ocr)
