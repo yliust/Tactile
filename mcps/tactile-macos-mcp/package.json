@@ -1,0 +1,26 @@
+{
+  "name": "tactile-macos-mcp",
+  "version": "0.1.0",
+  "description": "Computer Use style MCP facade for the local tactile macOS runtime",
+  "bin": {
+    "tactile-macos-mcp": "bin/tactile-macos-mcp"
+  },
+  "files": [
+    "bin/",
+    "scripts/ld-wrapper/",
+    "scripts/test_mcp.py",
+    "Sources/",
+    "Package.swift",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "xcrun swift build -c release -Xswiftc -swift-version -Xswiftc 5 -Xswiftc -use-ld=$PWD/scripts/ld-wrapper/ld",
+    "postinstall": "xcrun swift build -c release -Xswiftc -swift-version -Xswiftc 5 -Xswiftc -use-ld=$PWD/scripts/ld-wrapper/ld"
+  },
+  "os": [
+    "darwin"
+  ],
+  "engines": {
+    "node": ">=16"
+  }
+}
