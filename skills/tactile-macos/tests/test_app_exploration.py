@@ -66,6 +66,11 @@ class AppExplorationTests(unittest.TestCase):
 
         self.assertIn("feishu.open_messages", action_ids)
         self.assertIn("feishu.open_chat_draft", action_ids)
+        self.assertEqual(catalog["app_guide_metadata"]["source"], "catalog_actions")
+        self.assertIn("intents", catalog["app_guide_metadata"])
+        self.assertTrue(
+            any(intent["id"] == "feishu.open_messages" for intent in catalog["app_guide_metadata"]["intents"])
+        )
         for action in catalog["actions"]:
             self.assertIsInstance(action["verifier"], dict)
 
@@ -104,6 +109,9 @@ class AppExplorationTests(unittest.TestCase):
         self.assertEqual(result["mode"], "dry-run")
         self.assertEqual(result["verification"]["status"], "planned")
         self.assertEqual(result["steps"][0]["inputs"]["contact"], "张三")
+        self.assertEqual(result["trace"]["kind"], "tactile_trace")
+        self.assertEqual(result["trace"]["task"]["source"], "adapter_dry_run")
+        self.assertEqual(result["trace"]["outcome"]["verification_status"], "planned")
 
     def test_eval_suite_simple_yaml_and_metrics(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -121,6 +129,7 @@ class AppExplorationTests(unittest.TestCase):
             runs, summary = app_exploration.eval_suite(suite_path, strategy="code-aware", runs=2)
 
         self.assertEqual(len(runs), 4)
+        self.assertTrue(all(run.get("trace", {}).get("task", {}).get("source") == "adapter_dry_run" for run in runs))
         self.assertEqual(summary["total_runs"], 4)
         self.assertEqual(summary["verification_coverage"], 1.0)
         self.assertIn("feishu.open_messages", summary["by_task"])

@@ -7,6 +7,7 @@ import os
 import plistlib
 import re
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,10 @@ from typing import Any
 SCRIPTS_ROOT = Path(__file__).resolve().parent
 SKILL_ROOT = SCRIPTS_ROOT.parent
 APP_GUIDE_DIR = SKILL_ROOT / "references" / "app-guides"
+if os.fspath(SCRIPTS_ROOT) not in sys.path:
+    sys.path.insert(0, os.fspath(SCRIPTS_ROOT))
+
+from utils import tactile_trace
 
 SCHEMA_VERSION = 1
 MAX_RESOURCE_HINTS = 160
@@ -770,6 +775,7 @@ def catalog_from_profile(profile: dict[str, Any]) -> dict[str, Any]:
         },
         "profile": profile,
         "actions": actions,
+        "app_guide_metadata": guide_metadata_from_actions(profile, actions),
         "router": {
             "strategy_priorities": {key: list(value) for key, value in STRATEGY_PRIORITIES.items()},
             "visual_coordinate_policy": "single fresh visual action followed by re-observe; no repeated coordinate guesses",
@@ -779,6 +785,38 @@ def catalog_from_profile(profile: dict[str, Any]) -> dict[str, Any]:
             "max_default_fallback_rate": 0.30,
             "no_irreversible_default_actions": True,
         },
+    }
+
+
+def guide_metadata_from_actions(profile: dict[str, Any], actions: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "source": "catalog_actions",
+        "app": {
+            "key": profile.get("app_key"),
+            "display_name": (profile.get("identity") or {}).get("display_name"),
+            "group": profile.get("group"),
+        },
+        "app_guide": profile.get("app_guide"),
+        "intents": [
+            {
+                "id": action.get("id"),
+                "intent": action.get("intent"),
+                "safety_level": action.get("safety_level"),
+                "experimental": action.get("experimental"),
+                "inputs": action.get("inputs") or {},
+                "verifier": action.get("verifier"),
+                "preferred_actuator_kind": (action.get("preferred_actuator") or {}).get("kind")
+                if isinstance(action.get("preferred_actuator"), dict)
+                else None,
+                "fallback_actuator_kinds": [
+                    fallback.get("kind")
+                    for fallback in action.get("fallback_actuators") or []
+                    if isinstance(fallback, dict)
+                ],
+            }
+            for action in actions
+        ],
     }
 
 
@@ -898,7 +936,7 @@ def run_adapter(
     else:
         error_category = None
 
-    return {
+    result = {
         "schema_version": SCHEMA_VERSION,
         "mode": "dry-run",
         "app": (catalog.get("app") or {}).get("key") or app,
@@ -925,6 +963,70 @@ def run_adapter(
         "action": action,
         "route": route,
     }
+    result["trace"] = adapter_trace(result, action=action, route=route, verification=verification)
+    return result
+
+
+def adapter_trace(
+    result: dict[str, Any],
+    *,
+    action: dict[str, Any],
+    route: dict[str, Any],
+    verification: dict[str, Any],
+) -> dict[str, Any]:
+    selected = route.get("selected_actuator") if isinstance(route.get("selected_actuator"), dict) else {}
+    actuator_kind = selected.get("kind") if isinstance(selected, dict) else None
+    run_log = {
+        "target": {
+            "app": result.get("app"),
+            "task": result.get("task"),
+            "strategy": result.get("strategy"),
+        },
+        "instruction": str(result.get("task") or action.get("intent") or ""),
+        "task_source": "adapter_dry_run",
+        "final_status": "finished" if result.get("success") else "blocked",
+        "steps": [
+            {
+                "step": 1,
+                "target": {
+                    "app": result.get("app"),
+                    "task": result.get("task"),
+                    "strategy": result.get("strategy"),
+                },
+                "plan": {
+                    "status": "planned",
+                    "summary": action.get("intent"),
+                    "actions": [
+                        {
+                            "type": "route",
+                            "source": actuator_kind,
+                            "actuator_kind": actuator_kind,
+                        }
+                    ],
+                },
+                "execution_results": [
+                    {
+                        "index": 1,
+                        "action": {
+                            "type": "route",
+                            "source": actuator_kind,
+                            "actuator_kind": actuator_kind,
+                        },
+                        "ok": result.get("success"),
+                        "mode": actuator_kind,
+                        "fallback_from": "preferred_actuator" if int(result.get("fallback_count") or 0) > 0 else None,
+                        "fallback_reason": f"selected fallback index {result.get('fallback_count')}"
+                        if int(result.get("fallback_count") or 0) > 0
+                        else None,
+                    }
+                ],
+                "verification": verification,
+            }
+        ],
+    }
+    if result.get("error_category"):
+        run_log["reason"] = result.get("error_category")
+    return tactile_trace.build_trace(run_log, platform="macos")
 
 
 def parse_scalar(value: str) -> Any:

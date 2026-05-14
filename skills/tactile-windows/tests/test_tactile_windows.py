@@ -123,7 +123,7 @@ class TactileWindowsArtifactTests(unittest.TestCase):
 
             self.assertEqual(code, 0)
             cmd, cwd = calls[0]
-            self.assertEqual(cwd, sdk_root)
+            self.assertEqual(cwd.resolve(), sdk_root.resolve())
             self.assertIn("--plan-output", cmd)
             plan_path = Path(cmd[cmd.index("--plan-output") + 1])
             self.assertEqual(plan_path.parent, session_dir / "windows-app-workflow")

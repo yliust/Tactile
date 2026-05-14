@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import locale
 import os
@@ -20,6 +21,7 @@ from typing import Any
 
 SDK_ROOT = Path(__file__).resolve().parents[1]
 SDK_SCRIPT = SDK_ROOT / "WindowsUseSDK.ps1"
+SKILL_ROOT = SDK_ROOT.parents[1] if len(SDK_ROOT.parents) > 1 else None
 ALLOWED_ACTION_TYPES = {
     "click",
     "doubleclick",
@@ -870,6 +872,39 @@ def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+_TRACE_MODULE: Any | None = None
+_TRACE_LOAD_ATTEMPTED = False
+
+
+def load_tactile_trace_module() -> Any | None:
+    global _TRACE_LOAD_ATTEMPTED, _TRACE_MODULE
+    if _TRACE_LOAD_ATTEMPTED:
+        return _TRACE_MODULE
+    _TRACE_LOAD_ATTEMPTED = True
+    if SKILL_ROOT is None:
+        return None
+    module_path = SKILL_ROOT / "scripts" / "utils" / "tactile_trace.py"
+    if not module_path.exists():
+        return None
+    spec = importlib.util.spec_from_file_location("_tactile_windows_trace", module_path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        print(f"warning: could not load Tactile trace helper: {exc}", file=sys.stderr)
+        return None
+    _TRACE_MODULE = module
+    return module
+
+
+def refresh_trace(run_log: dict[str, Any]) -> None:
+    module = load_tactile_trace_module()
+    if module is not None:
+        run_log["trace"] = module.build_trace(run_log, platform="windows")
+
+
 def print_observation_debug(step_number: int, elements: list[dict[str, Any]], *, limit: int = 80) -> None:
     print(f"observation step {step_number}: {len(elements)} summarized elements", file=sys.stderr)
     for element in elements[:limit]:
@@ -999,10 +1034,12 @@ def main(argv: list[str] | None = None) -> int:
             run_log["final_status"] = status if status in {"finished", "blocked"} else "finished"
             break
         if args.plan_output:
+            refresh_trace(run_log)
             write_json(args.plan_output, run_log)
     else:
         run_log["final_status"] = "max_steps_reached"
 
+    refresh_trace(run_log)
     print(json.dumps(run_log, ensure_ascii=False, indent=2))
     if args.plan_output:
         write_json(args.plan_output, run_log)

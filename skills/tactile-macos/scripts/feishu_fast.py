@@ -11,6 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
+from utils import tactile_trace
+
 
 DEFAULT_TARGETS = ("com.electron.lark", "/Applications/Lark.app", "Lark", "Feishu", "飞书")
 
@@ -68,6 +70,21 @@ def normalize_text(value: Any) -> str:
     if value is None:
         return ""
     return re.sub(r"\s+", "", str(value)).casefold()
+
+
+def attach_trace(payload: dict[str, Any], *, command: str) -> dict[str, Any]:
+    if not isinstance(payload, dict) or "trace" in payload:
+        return payload
+    try:
+        payload["trace"] = tactile_trace.build_fast_path_trace(
+            payload,
+            platform="macos",
+            command=command,
+            instruction=command,
+        )
+    except Exception as exc:
+        payload["trace_error"] = str(exc)
+    return payload
 
 
 def wait_seconds(args: Any, *, default_ms: int = DEFAULT_WAIT_MS) -> float:
@@ -750,5 +767,6 @@ def dispatch(
         code, payload = handler(ctx, args)
     except Exception as exc:
         code, payload = 1, {"status": "failed", "command": args.command, "error": str(exc)}
+    payload = attach_trace(payload, command=args.command)
     write_or_print(payload, getattr(args, "output", None))
     return code

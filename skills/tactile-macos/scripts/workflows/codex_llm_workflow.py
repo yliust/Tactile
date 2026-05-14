@@ -40,6 +40,7 @@ if os.fspath(SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, os.fspath(SCRIPTS_ROOT))
 
 from utils import artifacts as artifact_utils
+from utils import tactile_trace
 
 APP_GUIDE_DIR = WORKFLOW_SKILL_ROOT / "references" / "app-guides"
 DEBUG_DIR = SWIFT_PACKAGE_ROOT / ".build" / "debug"
@@ -2474,7 +2475,14 @@ def execute_plan(
     target_pid: int,
     app_profile: AppProfile | None = None,
 ) -> list[dict[str, Any]]:
-    input_tool = tool_path("InputControllerTool")
+    input_tool: str | None = None
+
+    def get_input_tool() -> str:
+        nonlocal input_tool
+        if input_tool is None:
+            input_tool = tool_path("InputControllerTool")
+        return input_tool
+
     results: list[dict[str, Any]] = []
     for i, action in enumerate(actions, start=1):
         action_type = action["type"]
@@ -2489,6 +2497,7 @@ def execute_plan(
             continue
 
         if action_type in {"click", "doubleclick", "rightclick", "mousemove"}:
+            current_input_tool = get_input_tool()
             element = action_element(action, element_index)
             activated_pid, activation = maybe_activate_for_action(
                 action_type=action_type,
@@ -2500,7 +2509,7 @@ def execute_plan(
             ax_pid = target_pid
             if action_type == "click" and element is not None and element.ax_path is not None:
                 try:
-                    proc = run_command([input_tool, "axactivate", str(ax_pid), element.ax_path], timeout=10)
+                    proc = run_command([current_input_tool, "axactivate", str(ax_pid), element.ax_path], timeout=10)
                     results.append({
                         "index": i,
                         "action": action,
@@ -2539,7 +2548,7 @@ def execute_plan(
                         file=sys.stderr,
                     )
             x, y = action_point(action, element_index)
-            proc = run_command([input_tool, action_type, f"{x:.1f}", f"{y:.1f}"], timeout=10)
+            proc = run_command([current_input_tool, action_type, f"{x:.1f}", f"{y:.1f}"], timeout=10)
             results.append(
                 {
                     "index": i,
@@ -2555,6 +2564,7 @@ def execute_plan(
             time.sleep(0.2)
             continue
         if action_type == "scroll":
+            current_input_tool = get_input_tool()
             element = action_element(action, element_index)
             activated_pid, activation = maybe_activate_for_action(
                 action_type=action_type,
@@ -2566,7 +2576,7 @@ def execute_plan(
             x, y = action_point(action, element_index)
             delta_y = int(action.get("deltaY", action.get("delta_y", 5)))
             delta_x = int(action.get("deltaX", action.get("delta_x", 0)))
-            proc = run_command([input_tool, "scroll", f"{x:.1f}", f"{y:.1f}", str(delta_y), str(delta_x)], timeout=10)
+            proc = run_command([current_input_tool, "scroll", f"{x:.1f}", f"{y:.1f}", str(delta_y), str(delta_x)], timeout=10)
             results.append(
                 {
                     "index": i,
@@ -2605,6 +2615,7 @@ def execute_plan(
                 )
                 time.sleep(0.2)
                 continue
+            current_input_tool = get_input_tool()
             activated_pid, activation = maybe_activate_for_action(
                 action_type=action_type,
                 element=element,
@@ -2627,7 +2638,7 @@ def execute_plan(
                 if prefer_event_input:
                     try:
                         focus_diagnostics = focus_text_target(
-                            input_tool=input_tool,
+                            input_tool=current_input_tool,
                             element=element,
                             target_pid=ax_pid,
                             allow_coordinate_fallback=not is_feishu_lark_context(target_identifier, app_profile),
@@ -2655,7 +2666,7 @@ def execute_plan(
                                 time.sleep(0.2)
                                 continue
                         proc, paste_diagnostics = paste_text_via_clipboard(
-                            input_tool=input_tool,
+                            input_tool=current_input_tool,
                             text=text,
                             replace_existing=True,
                         )
@@ -2688,7 +2699,7 @@ def execute_plan(
                         )
                 if element is not None and element.ax_path is not None and not prefer_event_input:
                     try:
-                        proc = run_command([input_tool, "axsetvalue", str(ax_pid), element.ax_path, text], timeout=max(10, len(text) * 0.2))
+                        proc = run_command([current_input_tool, "axsetvalue", str(ax_pid), element.ax_path, text], timeout=max(10, len(text) * 0.2))
                         results.append({
                             "index": i,
                             "action": {"type": "writetext", "element_id": element.element_id, "text_length": len(text)},
@@ -2710,7 +2721,7 @@ def execute_plan(
                             f"{(exc.stderr or exc.stdout).strip()[-800:]}",
                             file=sys.stderr,
                         )
-                proc = run_command([input_tool, "writetext", text], timeout=max(10, len(text) * 0.2))
+                proc = run_command([current_input_tool, "writetext", text], timeout=max(10, len(text) * 0.2))
                 results.append(
                     {
                         "index": i,
@@ -2729,6 +2740,7 @@ def execute_plan(
             time.sleep(0.2)
             continue
         if action_type == "keypress":
+            current_input_tool = get_input_tool()
             activated_pid, activation = maybe_activate_for_action(
                 action_type=action_type,
                 element=None,
@@ -2738,7 +2750,7 @@ def execute_plan(
             key = str(action.get("key") or action.get("keys") or "").strip()
             if not key:
                 raise ValueError(f"keypress action needs key: {action!r}")
-            proc = run_command([input_tool, "keypress", key], timeout=10)
+            proc = run_command([current_input_tool, "keypress", key], timeout=10)
             results.append({"index": i, "action": action, "ok": True, "activated_pid": activated_pid, "activation": activation, "stderr": proc.stderr[-1000:]})
             time.sleep(0.2)
             continue
@@ -2749,6 +2761,10 @@ def execute_plan(
 def write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def refresh_trace(run_log: dict[str, Any]) -> None:
+    run_log["trace"] = tactile_trace.build_trace(run_log, platform="macos")
 
 
 def print_observation_debug(step_number: int, elements: list[dict[str, Any]], *, limit: int = 80) -> None:
@@ -3225,11 +3241,13 @@ def main(argv: list[str] | None = None) -> int:
 
         previous_step_record = step_record
         if args.plan_output:
+            refresh_trace(run_log)
             write_json(args.plan_output, run_log)
     else:
         run_log["final_status"] = "max_steps_reached"
 
     run_log["completed_at"] = time.time()
+    refresh_trace(run_log)
     summary = {
         "final_status": run_log.get("final_status"),
         "workflow_mode": run_log.get("workflow_mode"),
