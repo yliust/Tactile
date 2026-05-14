@@ -59,6 +59,9 @@ Use the MCP server with:
 mcps/tactile-macos-mcp/bin/tactile-macos-mcp
 ```
 
+You can also directly ask your agent (Codex / Claude Code) to install this MCP:
+https://github.com/yliust/Tactile/tree/liuyong/mcps/tactile-macos-mcp
+
 ### Use Tactile as a skill
 
 Ask your agent to configure this skill from the repository:
