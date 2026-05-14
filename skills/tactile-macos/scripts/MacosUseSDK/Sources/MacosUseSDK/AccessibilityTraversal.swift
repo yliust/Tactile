@@ -38,6 +38,10 @@ public struct ElementData: Codable, Hashable, Sendable {
     public var width: Double?
     public var height: Double?
     public var axPath: String? = nil
+    public var axActions: [String]? = nil
+    public var isSettable: Bool? = nil
+    public var isFocused: Bool? = nil
+    public var isSelected: Bool? = nil
 
     // Implement Hashable for use in Set
     public func hash(into hasher: inout Hasher) {
@@ -262,6 +266,26 @@ fileprivate class AccessibilityTraversalOperation {
         return nil
     }
 
+    func getBoolValue(_ value: CFTypeRef?) -> Bool? {
+        guard let value = value, CFGetTypeID(value) == CFBooleanGetTypeID() else { return nil }
+        return CFBooleanGetValue((value as! CFBoolean))
+    }
+
+    func copyActionNames(element: AXUIElement) -> [String] {
+        var actions: CFArray?
+        guard AXUIElementCopyActionNames(element, &actions) == .success,
+              let values = actions as? [String] else {
+            return []
+        }
+        return values
+    }
+
+    func isValueSettable(element: AXUIElement) -> Bool {
+        var settable = DarwinBoolean(false)
+        let result = AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable)
+        return result == .success && settable.boolValue
+    }
+
     // Extract attributes, text, and geometry
     func extractElementAttributes(element: AXUIElement) -> (role: String, roleDesc: String?, text: String?, allTextParts: [String], position: CGPoint?, size: CGSize?) {
         var role = "AXUnknown"
@@ -363,13 +387,18 @@ fileprivate class AccessibilityTraversalOperation {
             }
 
             let passesOriginalFilter = !isNonInteractable || hasText
-            let shouldCollectElement = passesOriginalFilter && (!onlyVisibleElements || isGeometricallyVisible)
+            let shouldCollectElement = onlyVisibleElements ? isGeometricallyVisible : passesOriginalFilter
 
             if shouldCollectElement {
+                let actions = copyActionNames(element: element)
                 let elementData = ElementData(
                     role: displayRole, text: combinedText,
                     x: finalX, y: finalY, width: finalWidth, height: finalHeight,
-                    axPath: path
+                    axPath: path,
+                    axActions: actions.isEmpty ? nil : actions,
+                    isSettable: isValueSettable(element: element),
+                    isFocused: getBoolValue(copyAttributeValue(element: element, attribute: kAXFocusedAttribute as String)),
+                    isSelected: getBoolValue(copyAttributeValue(element: element, attribute: kAXSelectedAttribute as String))
                 )
                 if collectedElements.insert(elementData).inserted {
                     if hasText { statistics.with_text_count += 1 }

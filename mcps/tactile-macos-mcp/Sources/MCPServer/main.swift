@@ -503,16 +503,21 @@ func visibleWindowInfos(pid: pid_t) -> [WindowCaptureInfo] {
 }
 
 func getWindowInfo(pid: pid_t) -> WindowCaptureInfo? {
-    visibleWindowInfos(pid: pid).first { $0.layer == 0 } ?? visibleWindowInfos(pid: pid).first
+    let windows = visibleWindowInfos(pid: pid)
+    return windows.first { $0.layer == 0 } ?? windows.first
 }
 
-func captureFrame(for windows: [WindowCaptureInfo]) -> CGRect? {
-    let capturable = windows.filter {
+func substantialWindows(from windows: [WindowCaptureInfo]) -> [WindowCaptureInfo] {
+    windows.filter {
         $0.layer >= 0
             && $0.frame.width >= 20
             && $0.frame.height >= 20
             && $0.area >= 1_000
     }
+}
+
+func captureFrame(for windows: [WindowCaptureInfo]) -> CGRect? {
+    let capturable = substantialWindows(from: windows)
     guard let first = capturable.first else { return nil }
     return capturable.dropFirst().reduce(first.frame) { partial, window in
         partial.union(window.frame)
@@ -520,13 +525,7 @@ func captureFrame(for windows: [WindowCaptureInfo]) -> CGRect? {
 }
 
 func shouldCaptureWindowUnion(_ windows: [WindowCaptureInfo]) -> Bool {
-    let substantialWindows = windows.filter {
-        $0.layer >= 0
-            && $0.frame.width >= 20
-            && $0.frame.height >= 20
-            && $0.area >= 1_000
-    }
-    return substantialWindows.count > 1
+    substantialWindows(from: windows).count > 1
 }
 
 func imageSize(path: String) -> (Int, Int)? {
