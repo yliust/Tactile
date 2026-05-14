@@ -61,6 +61,13 @@ export TACTILE_MODEL='gpt-5.5'
 ```
 
 
+## macOS MCP
+
+We have added a dedicated Tactile MCP for macOS in `mcps/tactile-macos-mcp`.
+It provides a faster and easier-to-use MCP interface for operating macOS apps
+through Tactile's accessibility-first workflow.
+
+
 ## Why Tactile?
 
 Many computer-use agents start from screenshots:
