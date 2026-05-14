@@ -46,6 +46,23 @@ https://github.com/user-attachments/assets/7bc0f05e-9228-4cf1-abe3-ffb7e4722be2
 
 ## 如何使用 Tactile
 
+### 优先使用 macOS MCP
+
+在 macOS 上，可以优先使用 `mcps/tactile-macos-mcp` 中专门为 Tactile
+新增的 MCP。它更快、更好用，并且可以直接通过 MCP tools 暴露
+Tactile 的 accessibility-first 操作流程。
+
+使用 MCP server：
+
+```bash
+mcps/tactile-macos-mcp/bin/tactile-macos-mcp
+```
+
+你也可以直接告诉你的 agent（Codex / Claude Code）安装这个 MCP：
+https://github.com/yliust/Tactile/tree/liuyong/mcps/tactile-macos-mcp
+
+### 以 skill 方式使用 Tactile
+
 对 agent 输入以下指令，让它从仓库配置这个 skill：
 
 ```txt
