@@ -59,7 +59,7 @@ mcps/tactile-macos-mcp/bin/tactile-macos-mcp
 ```
 
 你也可以直接告诉你的 agent（Codex / Claude Code）安装这个 MCP：
-https://github.com/yliust/Tactile/tree/liuyong/mcps/tactile-macos-mcp
+https://github.com/yliust/Tactile/tree/main/mcps/tactile-macos-mcp
 
 ### 以 skill 方式使用 Tactile
 
