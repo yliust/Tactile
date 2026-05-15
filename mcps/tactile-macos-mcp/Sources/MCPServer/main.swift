@@ -18,6 +18,9 @@ let ocrRecognitionLevelEnum = ["accurate", "fast"]
 let summaryModeEnum = ["compact", "full", "metadata"]
 let defaultSummaryElementLimit = 80
 let summaryTextMaxLength = 500
+let elementFilterDescription = """
+Case-insensitive regular expression filter for narrowing the get_app_state summary. It matches each element's index, source, role, visible text, AX path, state flags, and secondary action names. Use plain text for one term, for example "张仲岳"; use regex alternation with | for multiple terms, for example "search|搜索|输入|联系人|张仲岳". Escape regex metacharacters when you need them literally. If the pattern is not valid regex, matching falls back to a case-insensitive literal contains check. element_filter only filters the tool output; it does not search, type, focus, or change the app. Full state files are not filtered. Increase element_limit if many elements match.
+"""
 
 enum ObservationMode: String, Codable, Sendable {
     case ax
@@ -1165,8 +1168,16 @@ func modelElements(for state: AppState) -> [IndexedElement] {
     state.elements.sorted(by: screenOrder)
 }
 
+func textMatchesFilter(_ text: String, filter: String) -> Bool {
+    guard !text.isEmpty else { return false }
+    if let regex = try? NSRegularExpression(pattern: filter, options: [.caseInsensitive]) {
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.firstMatch(in: text, range: range) != nil
+    }
+    return text.range(of: filter, options: [.caseInsensitive, .diacriticInsensitive]) != nil
+}
+
 func elementMatchesFilter(_ element: IndexedElement, filter: String) -> Bool {
-    let needle = filter.lowercased()
     let haystacks = [
         element.index,
         element.source,
@@ -1178,7 +1189,7 @@ func elementMatchesFilter(_ element: IndexedElement, filter: String) -> Bool {
         element.focused == true ? "focused" : "",
         element.selected == true ? "selected" : "",
     ]
-    return haystacks.contains { $0.lowercased().contains(needle) }
+    return haystacks.contains { textMatchesFilter($0, filter: filter) }
 }
 
 func limitedElements(_ elements: [IndexedElement], limit: Int) -> [IndexedElement] {
@@ -1778,11 +1789,8 @@ func listAppsSummary() throws -> String {
     return lines.joined(separator: "\n")
 }
 
-let scrollPixelsPerPage = 180.0
-let minimumScrollPixels = 12.0
-
 func scrollDelta(direction: String, pages: Double) throws -> (Int32, Int32) {
-    let amount = Int32(max(minimumScrollPixels, (abs(pages) * scrollPixelsPerPage).rounded()))
+    let amount = Int32(max(24, Int(abs(pages) * 600)))
     switch direction.lowercased() {
     case "down":
         return (-amount, 0)
@@ -2016,10 +2024,22 @@ func handleToolCall(_ name: String, arguments: [String: Value]?) async throws ->
         if let index {
             let pair = try await stateManager.element(app: app, index: index)
             let element = pair.1
-            let center = try elementCenter(element)
-            scrollPoint = center
-            let (dy, dx) = try scrollDelta(direction: direction, pages: pages)
-            try performCoordinateScroll(at: center, deltaY: dy, deltaX: dx)
+            if element.source == "ax" {
+                do {
+                    let action = "Scroll" + direction.prefix(1).uppercased() + direction.dropFirst().lowercased()
+                    try performSecondary(action: action, element: element, state: pair.0)
+                } catch {
+                    let center = try elementCenter(element)
+                    scrollPoint = center
+                    let (dy, dx) = try scrollDelta(direction: direction, pages: pages)
+                    try performCoordinateScroll(at: center, deltaY: dy, deltaX: dx)
+                }
+            } else {
+                let center = try elementCenter(element)
+                scrollPoint = center
+                let (dy, dx) = try scrollDelta(direction: direction, pages: pages)
+                try performCoordinateScroll(at: center, deltaY: dy, deltaX: dx)
+            }
         } else {
             guard let x, let y else {
                 throw TactileMCPError.invalidArgument("scroll requires either element_index or both x and y screenshot pixel coordinates")
@@ -2100,7 +2120,7 @@ func computerUseTools() -> [Tool] {
                 "ocr_recognition_level": prop("string", "macOS Vision OCR recognition level. Defaults to accurate.", enumValues: ocrRecognitionLevelEnum),
                 "summary_mode": prop("string", "Summary verbosity. Defaults to compact. compact returns prioritized controls/text, full returns all matching elements, metadata omits element listings. Full untruncated state is always written to /tmp/tactile-macos-mcp.", enumValues: summaryModeEnum),
                 "element_limit": prop("integer", "Maximum elements to include in the returned summary. Defaults to 80 for compact and unlimited for full."),
-                "element_filter": prop("string", "Case-insensitive filter applied to returned summary elements by index, source, role, text, AX path, state, or action name. Full state files are not filtered."),
+                "element_filter": prop("string", elementFilterDescription),
             ], required: ["app"]),
             annotations: readOnly
         ),
@@ -2142,14 +2162,14 @@ func computerUseTools() -> [Tool] {
         ),
         Tool(
             name: "scroll",
-            description: "Scroll an element or screenshot pixel coordinate in a direction by a calibrated number of pages.",
+            description: "Scroll an element or screenshot pixel coordinate in a direction by a number of pages.",
             inputSchema: schema([
                 "app": prop("string", "App name or bundle identifier"),
                 "element_index": prop("string", "Element identifier"),
                 "x": prop("number", "X coordinate in screenshot pixel coordinates"),
                 "y": prop("number", "Y coordinate in screenshot pixel coordinates"),
                 "direction": prop("string", "Scroll direction: up, down, left, or right"),
-                "pages": prop("number", "Number of calibrated pages to scroll. Fractional values are supported. Defaults to 1"),
+                "pages": prop("number", "Number of pages to scroll. Fractional values are supported. Defaults to 1"),
             ], required: ["app", "direction"]),
             annotations: mutating
         ),
@@ -2192,7 +2212,7 @@ func setupAndStartServer() async throws -> Server {
         name: "tactile-macos-mcp",
         version: "0.1.0",
         instructions: """
-        Computer Use style tools for macOS apps. Begin with get_app_state before action tools. Prefer AX element_index targets over OCRLine targets, and prefer OCRLine targets over raw visual coordinates. get_app_state defaults to observation_mode=ax_ocr and summary_mode=compact, returning prioritized Accessibility/OCR elements while writing the full untruncated state and screenshots to /tmp/tactile-macos-mcp. Use element_filter to retrieve a small focused summary, summary_mode=metadata for paths only, summary_mode=full for the old full element listing, ax for AX-only speed/privacy, or ax_ocr_visual to also attach the screenshot for visual reasoning by the calling model. Element output labels Accessibility coordinates as screenFrame/screenCenter and screenshot pixels as screenshotFrame/screenshotCenter. Raw click x/y defaults to screenshot pixel coordinates from the latest screenshot, but click also accepts coordinate_space=screen or screen_x/screen_y for macOS screen points. Scroll and drag raw coordinates remain screenshot pixels.
+        Computer Use style tools for macOS apps. Begin with get_app_state before action tools. Prefer AX element_index targets over OCRLine targets, and prefer OCRLine targets over raw visual coordinates. get_app_state defaults to observation_mode=ax_ocr and summary_mode=compact, returning prioritized Accessibility/OCR elements while writing the full untruncated state and screenshots to /tmp/tactile-macos-mcp. Use element_filter to retrieve a small focused summary, summary_mode=metadata for paths only, summary_mode=full for the old full element listing, ax for AX-only speed/privacy, or ax_ocr_visual to also attach the screenshot for visual reasoning by the calling model. element_filter is a case-insensitive regex over element index/source/role/text/AX path/state/actions; use plain text for one target and regex OR like "search|搜索|输入|联系人|张仲岳" for multiple terms. element_filter only narrows get_app_state output and does not type into or search inside the app. If the expected target is missing, increase element_limit, use summary_mode=full, or inspect the full_element_dump path before taking action. Element output labels Accessibility coordinates as screenFrame/screenCenter and screenshot pixels as screenshotFrame/screenshotCenter. Raw click x/y defaults to screenshot pixel coordinates from the latest screenshot, but click also accepts coordinate_space=screen or screen_x/screen_y for macOS screen points. Scroll and drag raw coordinates remain screenshot pixels.
         """,
         capabilities: .init(tools: .init(listChanged: false))
     )
