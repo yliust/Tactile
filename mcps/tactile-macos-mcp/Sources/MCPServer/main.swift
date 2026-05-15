@@ -1778,8 +1778,11 @@ func listAppsSummary() throws -> String {
     return lines.joined(separator: "\n")
 }
 
+let scrollPixelsPerPage = 180.0
+let minimumScrollPixels = 12.0
+
 func scrollDelta(direction: String, pages: Double) throws -> (Int32, Int32) {
-    let amount = Int32(max(24, Int(abs(pages) * 600)))
+    let amount = Int32(max(minimumScrollPixels, (abs(pages) * scrollPixelsPerPage).rounded()))
     switch direction.lowercased() {
     case "down":
         return (-amount, 0)
@@ -2013,22 +2016,10 @@ func handleToolCall(_ name: String, arguments: [String: Value]?) async throws ->
         if let index {
             let pair = try await stateManager.element(app: app, index: index)
             let element = pair.1
-            if element.source == "ax" {
-                do {
-                    let action = "Scroll" + direction.prefix(1).uppercased() + direction.dropFirst().lowercased()
-                    try performSecondary(action: action, element: element, state: pair.0)
-                } catch {
-                    let center = try elementCenter(element)
-                    scrollPoint = center
-                    let (dy, dx) = try scrollDelta(direction: direction, pages: pages)
-                    try performCoordinateScroll(at: center, deltaY: dy, deltaX: dx)
-                }
-            } else {
-                let center = try elementCenter(element)
-                scrollPoint = center
-                let (dy, dx) = try scrollDelta(direction: direction, pages: pages)
-                try performCoordinateScroll(at: center, deltaY: dy, deltaX: dx)
-            }
+            let center = try elementCenter(element)
+            scrollPoint = center
+            let (dy, dx) = try scrollDelta(direction: direction, pages: pages)
+            try performCoordinateScroll(at: center, deltaY: dy, deltaX: dx)
         } else {
             guard let x, let y else {
                 throw TactileMCPError.invalidArgument("scroll requires either element_index or both x and y screenshot pixel coordinates")
@@ -2151,14 +2142,14 @@ func computerUseTools() -> [Tool] {
         ),
         Tool(
             name: "scroll",
-            description: "Scroll an element or screenshot pixel coordinate in a direction by a number of pages.",
+            description: "Scroll an element or screenshot pixel coordinate in a direction by a calibrated number of pages.",
             inputSchema: schema([
                 "app": prop("string", "App name or bundle identifier"),
                 "element_index": prop("string", "Element identifier"),
                 "x": prop("number", "X coordinate in screenshot pixel coordinates"),
                 "y": prop("number", "Y coordinate in screenshot pixel coordinates"),
                 "direction": prop("string", "Scroll direction: up, down, left, or right"),
-                "pages": prop("number", "Number of pages to scroll. Fractional values are supported. Defaults to 1"),
+                "pages": prop("number", "Number of calibrated pages to scroll. Fractional values are supported. Defaults to 1"),
             ], required: ["app", "direction"]),
             annotations: mutating
         ),

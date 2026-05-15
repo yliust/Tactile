@@ -36,6 +36,12 @@ defaults to screenshot pixel coordinates, but `click` also accepts
 `coordinate_space=screen` or `screen_x`/`screen_y` for macOS screen points. Raw
 `scroll` and `drag` coordinates remain screenshot pixel coordinates.
 
+`scroll` uses controlled wheel events for both element-index and coordinate
+targets. `pages=1` is a gentle calibrated scroll step, and fractional `pages`
+values can be used for smaller adjustments. Native AX scroll actions remain
+available through `perform_secondary_action` when a full accessibility scroll is
+desired.
+
 ## Build
 
 ```bash
