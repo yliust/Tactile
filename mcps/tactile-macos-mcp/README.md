@@ -23,6 +23,9 @@ changing MCP schemas.
 `summary_mode=compact`, returning a prioritized subset of AX elements plus local
 macOS Vision OCR lines as coordinate-backed `OCRLine` elements with indexes like
 `o0`. Full, untruncated state is still written to `/tmp/tactile-macos-mcp`.
+When the target app is already running, `get_app_state` reuses the existing
+process without re-activating it, which avoids pulling background popovers or
+transient windows behind the app's main window during read-only observation.
 Pass `summary_mode=full` for the old full element listing,
 `summary_mode=metadata` for paths and window metadata only, `element_filter` to
 return only matching elements using a case-insensitive regular expression, or
@@ -39,13 +42,15 @@ literal. If a focused query returns too little, increase `element_limit`, use
 
 Pass `observation_mode=ax` for AX-only speed/privacy, or
 `observation_mode=ax_ocr_visual` to also attach the screenshot image to the MCP
-tool result. The intended targeting priority is AX elements first, then OCR
-lines, then raw screenshot pixel coordinates from the attached image. Element
-output labels Accessibility coordinates as `screenFrame`/`screenCenter` and
-screenshot pixels as `screenshotFrame`/`screenshotCenter`. Raw `click` `x`/`y`
-defaults to screenshot pixel coordinates, but `click` also accepts
-`coordinate_space=screen` or `screen_x`/`screen_y` for macOS screen points. Raw
-`scroll` and `drag` coordinates remain screenshot pixel coordinates.
+tool result. For AX elements, use `perform_secondary_action`. `click` is
+coordinate-only and should be used for OCR lines or other visual/coordinate-backed
+targets, with OCR lines preferred over raw screenshot pixel coordinates from
+the attached image when both are available. Element output labels Accessibility
+coordinates as `screenFrame`/`screenCenter` and screenshot pixels as
+`screenshotFrame`/`screenshotCenter`. Raw `click` `x`/`y` defaults to
+screenshot pixel coordinates, but `click` also accepts `coordinate_space=screen`
+or `screen_x`/`screen_y` for macOS screen points. Raw `scroll` and `drag`
+coordinates remain screenshot pixel coordinates.
 
 ## Build
 

@@ -1580,6 +1580,50 @@ func pasteTextWithClipboard(_ text: String) throws {
     snapshot.restore()
 }
 
+func normalizedAppURL(_ url: URL?) -> URL? {
+    url?.standardizedFileURL.resolvingSymlinksInPath()
+}
+
+func preferredRunningApplication(from candidates: [NSRunningApplication]) -> NSRunningApplication? {
+    candidates.sorted {
+        if $0.isActive != $1.isActive { return $0.isActive && !$1.isActive }
+        return $0.processIdentifier < $1.processIdentifier
+    }.first
+}
+
+func runningApplication(for identifier: String) -> NSRunningApplication? {
+    let trimmed = identifier.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+
+    if trimmed.hasSuffix(".app"), trimmed.contains("/") {
+        let targetURL = normalizedAppURL(URL(fileURLWithPath: trimmed))
+        let candidates = NSWorkspace.shared.runningApplications.filter {
+            normalizedAppURL($0.bundleURL) == targetURL
+        }
+        return preferredRunningApplication(from: candidates)
+    }
+
+    let bundleMatches = NSRunningApplication.runningApplications(withBundleIdentifier: trimmed)
+    if let match = preferredRunningApplication(from: bundleMatches) {
+        return match
+    }
+
+    let lowered = trimmed.lowercased()
+    let candidates = NSWorkspace.shared.runningApplications.filter { app in
+        if let name = app.localizedName?.lowercased(), name == lowered {
+            return true
+        }
+        if let bundleID = app.bundleIdentifier?.lowercased(), bundleID == lowered {
+            return true
+        }
+        if let bundleName = app.bundleURL?.deletingPathExtension().lastPathComponent.lowercased(), bundleName == lowered {
+            return true
+        }
+        return false
+    }
+    return preferredRunningApplication(from: candidates)
+}
+
 final class StateManager {
     private var states: [String: AppState] = [:]
 
@@ -1608,24 +1652,39 @@ final class StateManager {
             return cached
         }
 
-        let openResult = try await MacosUseSDK.openApplication(identifier: app)
-        guard let pid = Int32(exactly: openResult.pid) else {
-            throw TactileMCPError.appStateUnavailable("PID \(openResult.pid) is out of Int32 range")
+        let initialRunningApp = runningApplication(for: app)
+        let pid: Int32
+        let launchedAppName: String?
+        let didLaunchApp: Bool
+
+        if let initialRunningApp {
+            pid = initialRunningApp.processIdentifier
+            launchedAppName = nil
+            didLaunchApp = false
+        } else {
+            let openResult = try await MacosUseSDK.openApplication(identifier: app)
+            guard let launchedPID = Int32(exactly: openResult.pid) else {
+                throw TactileMCPError.appStateUnavailable("PID \(openResult.pid) is out of Int32 range")
+            }
+            pid = launchedPID
+            launchedAppName = openResult.appName
+            didLaunchApp = true
         }
-        let runningApp = NSRunningApplication(processIdentifier: openResult.pid)
-        runningApp?.activate(options: [])
-        try? await Task.sleep(nanoseconds: 120_000_000)
+        let runningApp = NSRunningApplication(processIdentifier: pid_t(pid))
+        if didLaunchApp {
+            try? await Task.sleep(nanoseconds: 120_000_000)
+        }
 
         let traversal = try MacosUseSDK.traverseAccessibilityTree(pid: pid, onlyVisibleElements: true, activateApp: false)
         let basename = "\(nowMillis())_\(safeComponent(key))_state"
         let screenshot = captureScreenshot(
-            pid: openResult.pid,
+            pid: pid_t(pid),
             basename: basename,
             clickPoint: clickPoint,
             fallbackFrame: windowFrame(from: traversal)
         )
-        let bundle = runningApp?.bundleIdentifier ?? applicationBundleInfo(pid: openResult.pid).0
-        let appName = runningApp?.localizedName ?? openResult.appName
+        let bundle = runningApp?.bundleIdentifier ?? applicationBundleInfo(pid: pid_t(pid)).0
+        let appName = runningApp?.localizedName ?? launchedAppName ?? app
         var elements = indexedElements(from: traversal, pid: pid, screenshot: screenshot)
         var ocrPayload: OCRPayload?
         var ocrError: String?
@@ -1937,30 +1996,26 @@ func handleToolCall(_ name: String, arguments: [String: Value]?) async throws ->
 
     case "click":
         let app = try getRequiredString(from: arguments, key: "app")
-        let state: AppState
+        if try getOptionalString(from: arguments, key: "element_index") != nil {
+            throw MCPError.invalidParams("click only accepts coordinate inputs. Use x/y screenshot pixels or screen_x/screen_y macOS screen points. For AX elements, use perform_secondary_action instead.")
+        }
+        let state = try await stateManager.state(for: app)
         let point: CGPoint
-        if let index = try getOptionalString(from: arguments, key: "element_index") {
-            let pair = try await stateManager.element(app: app, index: index)
-            state = pair.0
-            point = try elementCenter(pair.1)
+        let screenX = try getOptionalDouble(from: arguments, key: "screen_x")
+        let screenY = try getOptionalDouble(from: arguments, key: "screen_y")
+        if screenX != nil || screenY != nil {
+            guard let screenX, let screenY else {
+                throw MCPError.invalidParams("click requires both screen_x and screen_y when either is supplied")
+            }
+            point = CGPoint(x: screenX, y: screenY)
         } else {
-            state = try await stateManager.state(for: app)
-            let screenX = try getOptionalDouble(from: arguments, key: "screen_x")
-            let screenY = try getOptionalDouble(from: arguments, key: "screen_y")
-            if screenX != nil || screenY != nil {
-                guard let screenX, let screenY else {
-                    throw MCPError.invalidParams("click requires both screen_x and screen_y when either is supplied")
-                }
-                point = CGPoint(x: screenX, y: screenY)
+            let x = try getRequiredDouble(from: arguments, key: "x")
+            let y = try getRequiredDouble(from: arguments, key: "y")
+            let coordinateSpace = try parseCoordinateSpace(try getOptionalString(from: arguments, key: "coordinate_space"))
+            if coordinateSpace == "screen" {
+                point = CGPoint(x: x, y: y)
             } else {
-                let x = try getRequiredDouble(from: arguments, key: "x")
-                let y = try getRequiredDouble(from: arguments, key: "y")
-                let coordinateSpace = try parseCoordinateSpace(try getOptionalString(from: arguments, key: "coordinate_space"))
-                if coordinateSpace == "screen" {
-                    point = CGPoint(x: x, y: y)
-                } else {
-                    point = screenshotPointToScreen(x, y, state: state)
-                }
+                point = screenshotPointToScreen(x, y, state: state)
             }
         }
         let button = try getOptionalString(from: arguments, key: "mouse_button") ?? "left"
@@ -2126,10 +2181,9 @@ func computerUseTools() -> [Tool] {
         ),
         Tool(
             name: "click",
-            description: "Click an element by index, screenshot pixel coordinates, or macOS screen coordinates. Raw x/y default to screenshot pixels; pass coordinate_space=screen or screen_x/screen_y for screen points.",
+            description: "Click coordinate-backed targets only. Use x/y for screenshot pixel coordinates, or screen_x/screen_y for macOS screen points. This tool does not accept AX element_index input; for AX element operations, use perform_secondary_action.",
             inputSchema: schema([
                 "app": prop("string", "App name or bundle identifier"),
-                "element_index": prop("string", "Element index to click"),
                 "x": prop("number", "X coordinate. Defaults to screenshot pixel coordinates unless coordinate_space is screen."),
                 "y": prop("number", "Y coordinate. Defaults to screenshot pixel coordinates unless coordinate_space is screen."),
                 "coordinate_space": prop("string", "Coordinate space for x/y. Defaults to screenshot.", enumValues: coordinateSpaceEnum),
@@ -2142,7 +2196,7 @@ func computerUseTools() -> [Tool] {
         ),
         Tool(
             name: "perform_secondary_action",
-            description: "Invoke a secondary accessibility action exposed by an element. The action parameter is a fixed enum; unsupported element/action pairs return the element's actual supported AX actions.",
+            description: "Invoke a secondary accessibility action exposed by an element. Use this tool for AX element operations; click is coordinate-only. The action parameter is a fixed enum; unsupported element/action pairs return the element's actual supported AX actions.",
             inputSchema: schema([
                 "app": prop("string", "App name or bundle identifier"),
                 "element_index": prop("string", "Element identifier"),
@@ -2212,7 +2266,7 @@ func setupAndStartServer() async throws -> Server {
         name: "tactile-macos-mcp",
         version: "0.1.0",
         instructions: """
-        Computer Use style tools for macOS apps. Begin with get_app_state before action tools. Prefer AX element_index targets over OCRLine targets, and prefer OCRLine targets over raw visual coordinates. get_app_state defaults to observation_mode=ax_ocr and summary_mode=compact, returning prioritized Accessibility/OCR elements while writing the full untruncated state and screenshots to /tmp/tactile-macos-mcp. Use element_filter to retrieve a small focused summary, summary_mode=metadata for paths only, summary_mode=full for the old full element listing, ax for AX-only speed/privacy, or ax_ocr_visual to also attach the screenshot for visual reasoning by the calling model. element_filter is a case-insensitive regex over element index/source/role/text/AX path/state/actions; use plain text for one target and regex OR like "search|搜索|输入|联系人|张仲岳" for multiple terms. element_filter only narrows get_app_state output and does not type into or search inside the app. If the expected target is missing, increase element_limit, use summary_mode=full, or inspect the full_element_dump path before taking action. Element output labels Accessibility coordinates as screenFrame/screenCenter and screenshot pixels as screenshotFrame/screenshotCenter. Raw click x/y defaults to screenshot pixel coordinates from the latest screenshot, but click also accepts coordinate_space=screen or screen_x/screen_y for macOS screen points. Scroll and drag raw coordinates remain screenshot pixels.
+        Computer Use style tools for macOS apps. Begin with get_app_state before action tools. For AX elements, use perform_secondary_action. click is coordinate-only and should be used for OCRLine or other visual/coordinate-backed targets, with OCRLine targets preferred over raw visual coordinates when both are available. get_app_state defaults to observation_mode=ax_ocr and summary_mode=compact, returning prioritized Accessibility/OCR elements while writing the full untruncated state and screenshots to /tmp/tactile-macos-mcp. Use element_filter to retrieve a small focused summary, summary_mode=metadata for paths only, summary_mode=full for the old full element listing, ax for AX-only speed/privacy, or ax_ocr_visual to also attach the screenshot for visual reasoning by the calling model. element_filter is a case-insensitive regex over element index/source/role/text/AX path/state/actions; use plain text for one target and regex OR like "search|搜索|输入|联系人|张仲岳" for multiple terms. element_filter only narrows get_app_state output and does not type into or search inside the app. If the expected target is missing, increase element_limit, use summary_mode=full, or inspect the full_element_dump path before taking action. Element output labels Accessibility coordinates as screenFrame/screenCenter and screenshot pixels as screenshotFrame/screenshotCenter. Raw click x/y defaults to screenshot pixel coordinates from the latest screenshot, but click also accepts coordinate_space=screen or screen_x/screen_y for macOS screen points. Scroll and drag raw coordinates remain screenshot pixels.
         """,
         capabilities: .init(tools: .init(listChanged: false))
     )

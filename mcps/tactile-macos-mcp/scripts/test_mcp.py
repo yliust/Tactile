@@ -154,6 +154,12 @@ def find_property_enum(tool, property_name):
     return set(prop.get("enum", []))
 
 
+def assert_contains_all(text, expected_fragments, label):
+    missing = [fragment for fragment in expected_fragments if fragment not in text]
+    if missing:
+        raise AssertionError(f"{label} missing fragments: {missing}; text={text}")
+
+
 def test_tools(client):
     result = client.list_tools()
     tools = result.get("tools", [])
@@ -188,9 +194,31 @@ def test_tools(client):
             f"extra={sorted(coordinate_spaces - EXPECTED_COORDINATE_SPACES)}"
         )
     click_properties = by_name["click"].get("inputSchema", {}).get("properties", {})
+    if "element_index" in click_properties:
+        raise AssertionError("click schema should not expose element_index")
     for property_name in ("screen_x", "screen_y"):
         if property_name not in click_properties:
             raise AssertionError(f"click schema missing {property_name}")
+    click_description = by_name["click"].get("description", "")
+    assert_contains_all(
+        click_description,
+        [
+            "Click coordinate-backed targets only.",
+            "This tool does not accept AX element_index input; for AX element operations, use perform_secondary_action.",
+        ],
+        "click description",
+    )
+    secondary_action_description = by_name["perform_secondary_action"].get("description", "")
+    assert_contains_all(
+        secondary_action_description,
+        [
+            "Use this tool for AX element operations; click is coordinate-only.",
+        ],
+        "perform_secondary_action description",
+    )
+    click_result = client.call_tool("click", {"app": "TextEdit", "element_index": "1"})
+    if not click_result.get("isError") or "coordinate" not in content_text(click_result).lower():
+        raise AssertionError("click should reject element_index inputs")
     result = client.call_tool("set_value")
     if not result.get("isError") or "disabled" not in content_text(result).lower():
         raise AssertionError("set_value should remain listed but return a disabled error")
