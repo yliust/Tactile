@@ -7,6 +7,7 @@
   },
   "files": [
     "bin/",
+    "scripts/build-release.sh",
     "scripts/ld-wrapper/",
     "scripts/test_mcp.py",
     "Sources/",
@@ -14,8 +15,8 @@
     "README.md"
   ],
   "scripts": {
-    "build": "xcrun swift build -c release -Xswiftc -swift-version -Xswiftc 5 -Xswiftc -use-ld=$PWD/scripts/ld-wrapper/ld",
-    "postinstall": "xcrun swift build -c release -Xswiftc -swift-version -Xswiftc 5 -Xswiftc -use-ld=$PWD/scripts/ld-wrapper/ld"
+    "build": "bash ./scripts/build-release.sh",
+    "postinstall": "bash ./scripts/build-release.sh"
   },
   "os": [
     "darwin"

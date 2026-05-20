@@ -1,7 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
-REAL_LD="${TACTILE_MACOS_MCP_REAL_LD:-/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld}"
+if [[ -n "${TACTILE_MACOS_MCP_REAL_LD:-}" ]]; then
+  REAL_LD="${TACTILE_MACOS_MCP_REAL_LD}"
+elif command -v xcrun >/dev/null 2>&1; then
+  REAL_LD="$(xcrun --find ld 2>/dev/null || true)"
+fi
+
+REAL_LD="${REAL_LD:-/usr/bin/ld}"
 
 filtered=()
 for arg in "$@"; do
