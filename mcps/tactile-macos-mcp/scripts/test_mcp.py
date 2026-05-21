@@ -41,8 +41,7 @@ EXPECTED_ACTIONS = {
 }
 
 EXPECTED_OBSERVATION_MODES = {"ax", "ax_ocr", "ax_ocr_visual"}
-EXPECTED_COORDINATE_SPACES = {"screenshot", "screen"}
-EXPECTED_SUMMARY_MODES = {"compact", "full", "metadata"}
+EXPECTED_SUMMARY_MODES = {"full", "metadata", "tsv"}
 
 
 class MCPClient:
@@ -187,23 +186,18 @@ def test_tools(client):
             f"get_app_state summary_mode enum mismatch: missing={sorted(EXPECTED_SUMMARY_MODES - summary_modes)} "
             f"extra={sorted(summary_modes - EXPECTED_SUMMARY_MODES)}"
         )
-    coordinate_spaces = find_property_enum(by_name["click"], "coordinate_space")
-    if coordinate_spaces != EXPECTED_COORDINATE_SPACES:
-        raise AssertionError(
-            f"click coordinate_space enum mismatch: missing={sorted(EXPECTED_COORDINATE_SPACES - coordinate_spaces)} "
-            f"extra={sorted(coordinate_spaces - EXPECTED_COORDINATE_SPACES)}"
-        )
     click_properties = by_name["click"].get("inputSchema", {}).get("properties", {})
     if "element_index" in click_properties:
         raise AssertionError("click schema should not expose element_index")
-    for property_name in ("screen_x", "screen_y"):
-        if property_name not in click_properties:
-            raise AssertionError(f"click schema missing {property_name}")
+    for property_name in ("coordinate_space", "screen_x", "screen_y"):
+        if property_name in click_properties:
+            raise AssertionError(f"click schema should not expose {property_name}")
     click_description = by_name["click"].get("description", "")
     assert_contains_all(
         click_description,
         [
             "Click coordinate-backed targets only.",
+            "x/y macOS screen points",
             "This tool does not accept AX element_index input; for AX element operations, use perform_secondary_action.",
         ],
         "click description",
@@ -219,6 +213,13 @@ def test_tools(client):
     click_result = client.call_tool("click", {"app": "TextEdit", "element_index": "1"})
     if not click_result.get("isError") or "coordinate" not in content_text(click_result).lower():
         raise AssertionError("click should reject element_index inputs")
+    legacy_coords_result = client.call_tool(
+        "click",
+        {"app": "TextEdit", "x": 10, "y": 20, "screen_x": 0, "screen_y": 0},
+    )
+    legacy_coords_text = content_text(legacy_coords_result).lower()
+    if not legacy_coords_result.get("isError") or "no longer accepts" not in legacy_coords_text:
+        raise AssertionError("click should reject legacy alternate coordinate fields")
     result = client.call_tool("set_value")
     if not result.get("isError") or "disabled" not in content_text(result).lower():
         raise AssertionError("set_value should remain listed but return a disabled error")
@@ -242,10 +243,32 @@ def test_state(client, app):
     text = content_text(result)
     if app.lower() not in text.lower() and "state_path" not in text:
         raise AssertionError(f"unexpected get_app_state response: {text[:400]}")
-    if "summary_mode: compact" not in text:
-        raise AssertionError(f"get_app_state should default to compact summary: {text[:400]}")
+    if "summary_mode: tsv" not in text:
+        raise AssertionError(f"get_app_state should default to tsv summary: {text[:400]}")
+    if "format: tsv" not in text:
+        raise AssertionError(f"default get_app_state should advertise tsv format: {text[:400]}")
+    if "index\tsource\trole\ttext\tflags\tconfidence\tcenter\tframe\tactions\tax_path" not in text:
+        raise AssertionError(f"default get_app_state should include a tsv header row: {text[:400]}")
     if "full_element_dump:" not in text:
-        raise AssertionError(f"get_app_state compact summary should include full dump path: {text[:400]}")
+        raise AssertionError(f"get_app_state tsv summary should include full dump path: {text[:400]}")
+    if "screenshotFrame:" in text or "screenshotCenter:" in text:
+        raise AssertionError(f"get_app_state tsv summary should not expose screenshot coordinates: {text[:400]}")
+    compact_result = client.call_tool("get_app_state", {"app": app, "summary_mode": "compact"})
+    compact_text = content_text(compact_result).lower()
+    if not compact_result.get("isError") or "unsupported summary_mode compact" not in compact_text:
+        raise AssertionError("get_app_state should reject the removed compact summary mode")
+    tsv_result = client.call_tool("get_app_state", {"app": app, "observation_mode": "ax", "summary_mode": "tsv"})
+    if tsv_result.get("isError"):
+        raise AssertionError(content_text(tsv_result))
+    tsv_text = content_text(tsv_result)
+    if "summary_mode: tsv" not in tsv_text:
+        raise AssertionError(f"tsv summary should report tsv mode: {tsv_text[:400]}")
+    if "format: tsv" not in tsv_text:
+        raise AssertionError(f"tsv summary should advertise tabular format: {tsv_text[:400]}")
+    if "index\tsource\trole\ttext\tflags\tconfidence\tcenter\tframe\tactions\tax_path" not in tsv_text:
+        raise AssertionError(f"tsv summary should include a header row: {tsv_text[:400]}")
+    if "AX elements (" in tsv_text or "OCR lines (" in tsv_text:
+        raise AssertionError(f"tsv summary should not include prose element sections: {tsv_text[:400]}")
     metadata_result = client.call_tool("get_app_state", {"app": app, "observation_mode": "ax", "summary_mode": "metadata"})
     if metadata_result.get("isError"):
         raise AssertionError(content_text(metadata_result))

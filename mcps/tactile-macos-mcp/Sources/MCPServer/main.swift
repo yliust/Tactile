@@ -11,13 +11,14 @@ let secondaryActionEnum = [
     "Press", "Raise", "ShowMenu", "Confirm", "Cancel", "Increment", "Decrement",
     "Focus", "Select", "Deselect", "ScrollUp", "ScrollDown", "ScrollLeft", "ScrollRight",
 ]
-let coordinateSpaceEnum = ["screenshot", "screen"]
 let observationModeEnum = ["ax", "ax_ocr", "ax_ocr_visual"]
 let defaultOCRLanguages = "zh-Hans,en-US"
 let ocrRecognitionLevelEnum = ["accurate", "fast"]
-let summaryModeEnum = ["compact", "full", "metadata"]
+let summaryModeEnum = ["full", "metadata", "tsv"]
 let defaultSummaryElementLimit = 80
 let summaryTextMaxLength = 500
+// Approximate a single desktop task until the caller can pass an explicit session token.
+let appUseSessionIdleTimeout: Double = 120
 let elementFilterDescription = """
 Case-insensitive regular expression filter for narrowing the get_app_state summary. It matches each element's index, source, role, visible text, AX path, state flags, and secondary action names. Use plain text for one term, for example "张仲岳"; use regex alternation with | for multiple terms, for example "search|搜索|输入|联系人|张仲岳". Escape regex metacharacters when you need them literally. If the pattern is not valid regex, matching falls back to a case-insensitive literal contains check. element_filter only filters the tool output; it does not search, type, focus, or change the app. Full state files are not filtered. Increase element_limit if many elements match.
 """
@@ -37,13 +38,13 @@ enum ObservationMode: String, Codable, Sendable {
 }
 
 enum SummaryMode: String, Sendable {
-    case compact
     case full
     case metadata
+    case tsv
 }
 
 struct SummaryOptions: Sendable {
-    var mode: SummaryMode = .compact
+    var mode: SummaryMode = .tsv
     var elementLimit: Int = defaultSummaryElementLimit
     var elementFilter: String? = nil
 }
@@ -89,8 +90,6 @@ struct PointInfo: Codable, Sendable {
 struct OCRLine: Codable, Sendable {
     var text: String
     var confidence: Double
-    var frame: Frame
-    var imageFrame: Frame
     var screenFrame: Frame
     var screenCenter: PointInfo
 }
@@ -102,8 +101,6 @@ struct OCRSource: Codable, Sendable {
 }
 
 struct OCRCoordinateSpace: Codable, Sendable {
-    var frame: String
-    var imageFrame: String
     var screenFrame: String
 }
 
@@ -139,9 +136,7 @@ struct IndexedElement: Codable, Sendable {
     var role: String
     var text: String?
     var screenFrame: Frame?
-    var screenshotFrame: Frame? = nil
     var screenCenter: PointInfo?
-    var screenshotCenter: PointInfo? = nil
     var confidence: Double? = nil
     var axPath: String?
     var settable: Bool
@@ -176,6 +171,11 @@ struct AppRecord: Codable, Sendable {
     var pid: Int32?
     var running: Bool
     var frontmost: Bool
+}
+
+struct AppUseSession: Sendable {
+    var pid: Int32
+    var lastTouchedAt: Double
 }
 
 enum TactileMCPError: Error, LocalizedError {
@@ -301,14 +301,6 @@ func getOptionalInt(from args: [String: Value]?, key: String) throws -> Int? {
     if let double = value.doubleValue, let int = Int(exactly: double) { return int }
     if let string = value.stringValue, let int = Int(string) { return int }
     throw MCPError.invalidParams("Invalid integer argument: \(key)")
-}
-
-func parseCoordinateSpace(_ value: String?) throws -> String {
-    let normalized = (value ?? "screenshot").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    guard coordinateSpaceEnum.contains(normalized) else {
-        throw MCPError.invalidParams("Invalid coordinate_space \(normalized). Allowed: \(coordinateSpaceEnum.joined(separator: ", "))")
-    }
-    return normalized
 }
 
 func appKey(_ app: String) -> String {
@@ -475,8 +467,8 @@ func setAXStringValue(_ element: AXUIElement, value: String) throws {
     }
 }
 
-func visibleWindowInfos(pid: pid_t) -> [WindowCaptureInfo] {
-    guard let windowList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
+func windowInfos(pid: pid_t, options: CGWindowListOption) -> [WindowCaptureInfo] {
+    guard let windowList = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
         return []
     }
     var windows: [WindowCaptureInfo] = []
@@ -505,9 +497,19 @@ func visibleWindowInfos(pid: pid_t) -> [WindowCaptureInfo] {
     }
 }
 
+func visibleWindowInfos(pid: pid_t) -> [WindowCaptureInfo] {
+    windowInfos(pid: pid, options: [.optionOnScreenOnly, .excludeDesktopElements])
+}
+
 func getWindowInfo(pid: pid_t) -> WindowCaptureInfo? {
-    let windows = visibleWindowInfos(pid: pid)
-    return windows.first { $0.layer == 0 } ?? windows.first
+    let visible = visibleWindowInfos(pid: pid)
+    if let visibleMatch = visible.first(where: { $0.layer == 0 }) ?? visible.first {
+        return visibleMatch
+    }
+    // Some Electron apps, including Lark/Feishu, can omit their main window from
+    // the .optionOnScreenOnly query even while the window is visibly frontmost.
+    let fallback = windowInfos(pid: pid, options: [.excludeDesktopElements])
+    return fallback.first { $0.layer == 0 } ?? fallback.first
 }
 
 func substantialWindows(from windows: [WindowCaptureInfo]) -> [WindowCaptureInfo] {
@@ -659,7 +661,7 @@ func parseOCRRecognitionLevel(_ value: String?) throws -> String {
 }
 
 func parseSummaryMode(_ value: String?) throws -> SummaryMode {
-    let raw = value ?? SummaryMode.compact.rawValue
+    let raw = value ?? SummaryMode.tsv.rawValue
     guard let mode = SummaryMode(rawValue: raw) else {
         throw TactileMCPError.invalidArgument("Unsupported summary_mode \(raw). Allowed: \(summaryModeEnum.joined(separator: ", "))")
     }
@@ -668,7 +670,7 @@ func parseSummaryMode(_ value: String?) throws -> SummaryMode {
 
 func parseSummaryOptions(from arguments: [String: Value]?) throws -> SummaryOptions {
     let mode = try parseSummaryMode(try getOptionalString(from: arguments, key: "summary_mode"))
-    let defaultLimit = mode == .full ? Int.max : defaultSummaryElementLimit
+    let defaultLimit = (mode == .full || mode == .tsv) ? Int.max : defaultSummaryElementLimit
     let elementLimit = try getOptionalInt(from: arguments, key: "element_limit") ?? defaultLimit
     guard elementLimit >= 0 else {
         throw TactileMCPError.invalidArgument("element_limit must be greater than or equal to 0")
@@ -721,8 +723,6 @@ func runOCR(imagePath: String, screenshot: ScreenshotInfo, languages: [String], 
                 OCRLine(
                     text: candidate.string,
                     confidence: Double(candidate.confidence),
-                    frame: imageFrame,
-                    imageFrame: imageFrame,
                     screenFrame: frame,
                     screenCenter: PointInfo(x: frame.x + frame.width / 2, y: frame.y + frame.height / 2)
                 )
@@ -747,10 +747,10 @@ func runOCR(imagePath: String, screenshot: ScreenshotInfo, languages: [String], 
     }
 
     lines.sort {
-        if abs($0.frame.y - $1.frame.y) > 4 {
-            return $0.frame.y < $1.frame.y
+        if abs($0.screenFrame.y - $1.screenFrame.y) > 4 {
+            return $0.screenFrame.y < $1.screenFrame.y
         }
-        return $0.frame.x < $1.frame.x
+        return $0.screenFrame.x < $1.screenFrame.x
     }
 
     return OCRPayload(
@@ -761,11 +761,7 @@ func runOCR(imagePath: String, screenshot: ScreenshotInfo, languages: [String], 
         recognitionLevel: recognitionLevel,
         lines: lines,
         source: OCRSource(kind: "window_screenshot", region: screenshot.windowFrame, screenshot: imagePath),
-        coordinateSpace: OCRCoordinateSpace(
-            frame: "image_pixels_relative_to_screenshot",
-            imageFrame: "image_pixels_relative_to_screenshot",
-            screenFrame: "screen_points_top_left"
-        )
+        coordinateSpace: OCRCoordinateSpace(screenFrame: "screen_points_top_left")
     )
 }
 
@@ -777,9 +773,7 @@ func ocrElements(from payload: OCRPayload) -> [IndexedElement] {
             role: "OCRLine",
             text: line.text,
             screenFrame: line.screenFrame,
-            screenshotFrame: line.imageFrame,
             screenCenter: line.screenCenter,
-            screenshotCenter: center(of: line.imageFrame),
             confidence: line.confidence,
             axPath: nil,
             settable: false,
@@ -809,37 +803,9 @@ func visualObservation(for mode: ObservationMode, screenshot: ScreenshotInfo?, e
             frame: "screen_points_top_left",
             screenshotRegion: screenshot.windowFrame,
             screenshotPixels: PointInfo(x: Double(screenshot.pixelWidth), y: Double(screenshot.pixelHeight)),
-            rule: "Visual model should use the attached screenshot for reasoning. Raw click x/y, scroll, and drag coordinates default to screenshot pixels from this image; click can also use coordinate_space=screen or screen_x/screen_y for macOS screen points."
+            rule: "Visual model should use the attached screenshot for reasoning. All tool coordinates use macOS screen points with a top-left origin. The attached screenshot covers screenshotRegion on screen."
         ),
         error: error
-    )
-}
-
-func screenshotPointToScreen(_ x: Double, _ y: Double, state: AppState) -> CGPoint {
-    guard let screenshot = state.screenshot else {
-        return CGPoint(x: x, y: y)
-    }
-    return CGPoint(
-        x: screenshot.windowFrame.x + x / screenshot.scaleX,
-        y: screenshot.windowFrame.y + y / screenshot.scaleY
-    )
-}
-
-func screenPointToScreenshot(_ point: CGPoint, screenshot: ScreenshotInfo?) -> PointInfo? {
-    guard let screenshot else { return nil }
-    return PointInfo(
-        x: (point.x - screenshot.windowFrame.x) * screenshot.scaleX,
-        y: (point.y - screenshot.windowFrame.y) * screenshot.scaleY
-    )
-}
-
-func screenFrameToScreenshot(_ frame: Frame?, screenshot: ScreenshotInfo?) -> Frame? {
-    guard let frame, let screenshot else { return nil }
-    return Frame(
-        x: (frame.x - screenshot.windowFrame.x) * screenshot.scaleX,
-        y: (frame.y - screenshot.windowFrame.y) * screenshot.scaleY,
-        width: frame.width * screenshot.scaleX,
-        height: frame.height * screenshot.scaleY
     )
 }
 
@@ -924,16 +890,80 @@ func describeElement(_ element: IndexedElement, maxTextLength: Int? = nil) -> St
     if let center = element.screenCenter {
         parts.append("screenCenter:x:\(Int(center.x)) y:\(Int(center.y))")
     }
-    if let screenshotFrame = element.screenshotFrame {
-        parts.append("screenshotFrame:x:\(Int(screenshotFrame.x)) y:\(Int(screenshotFrame.y)) w:\(Int(screenshotFrame.width)) h:\(Int(screenshotFrame.height))")
-    }
-    if let screenshotCenter = element.screenshotCenter {
-        parts.append("screenshotCenter:x:\(Int(screenshotCenter.x)) y:\(Int(screenshotCenter.y))")
-    }
     if !element.secondaryActions.isEmpty {
         parts.append("Secondary Actions: \(element.secondaryActions.joined(separator: ", "))")
     }
     return parts.joined(separator: " ")
+}
+
+func sanitizeTabularField(_ value: String?) -> String {
+    guard let value else { return "-" }
+    let sanitized = value
+        .replacingOccurrences(of: "\r", with: " ")
+        .replacingOccurrences(of: "\n", with: " ")
+        .replacingOccurrences(of: "\t", with: " ")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    return sanitized.isEmpty ? "-" : sanitized
+}
+
+func compactFrameValue(_ frame: Frame?) -> String {
+    guard let frame else { return "-" }
+    return "\(Int(frame.x)),\(Int(frame.y)),\(Int(frame.width)),\(Int(frame.height))"
+}
+
+func compactCenterValue(_ center: PointInfo?) -> String {
+    guard let center else { return "-" }
+    return "\(Int(center.x)),\(Int(center.y))"
+}
+
+func elementFlags(_ element: IndexedElement, in state: AppState) -> String {
+    var flags: [String] = []
+    if element.settable {
+        flags.append("settable")
+    }
+    if element.focused == true || state.focusedElementIndex == element.index {
+        flags.append("focused")
+    }
+    if element.selected == true {
+        flags.append("selected")
+    }
+    if element.source == "ax" && isOverlayLikeElement(element, in: state) {
+        flags.append("overlay")
+    }
+    return flags.isEmpty ? "-" : flags.joined(separator: "|")
+}
+
+func tabularElementRow(_ element: IndexedElement, in state: AppState, maxTextLength: Int? = nil) -> String {
+    let text: String
+    if let rawText = element.text, let maxTextLength {
+        text = clippedSummaryText(rawText, maxLength: maxTextLength)
+    } else {
+        text = element.text ?? ""
+    }
+    let confidence = element.confidence.map { String(format: "%.2f", $0) } ?? "-"
+    let actions = element.secondaryActions.isEmpty ? "-" : element.secondaryActions.joined(separator: "|")
+    return [
+        sanitizeTabularField(element.index),
+        sanitizeTabularField(element.source),
+        sanitizeTabularField(element.role),
+        sanitizeTabularField(text),
+        elementFlags(element, in: state),
+        confidence,
+        compactCenterValue(element.screenCenter),
+        compactFrameValue(element.screenFrame),
+        sanitizeTabularField(actions),
+        sanitizeTabularField(element.axPath),
+    ].joined(separator: "\t")
+}
+
+func tabularHeaderLine() -> String {
+    "index\tsource\trole\ttext\tflags\tconfidence\tcenter\tframe\tactions\tax_path"
+}
+
+func tabularElementBlock(_ elements: [IndexedElement], state: AppState, maxTextLength: Int? = nil) -> [String] {
+    var lines = [tabularHeaderLine()]
+    lines.append(contentsOf: elements.map { tabularElementRow($0, in: state, maxTextLength: maxTextLength) })
+    return lines
 }
 
 func hasVisibleFrame(_ element: IndexedElement) -> Bool {
@@ -1206,9 +1236,9 @@ func summaryElements(for state: AppState, options: SummaryOptions) -> [IndexedEl
         return limitedElements(filtered, limit: options.elementLimit)
     }
     switch options.mode {
-    case .compact:
-        return keyElements(for: state, limit: options.elementLimit)
     case .full:
+        return limitedElements(modelElements(for: state), limit: options.elementLimit)
+    case .tsv:
         return limitedElements(modelElements(for: state), limit: options.elementLimit)
     case .metadata:
         return []
@@ -1242,24 +1272,13 @@ func flatStateText(_ state: AppState) -> String {
     if let error = state.ocrError {
         lines.append("# ocr_error: \(error)")
     }
-    lines.append("# ax_elements:")
-    for element in state.elements.filter({ $0.source == "ax" }) {
-        lines.append(describeElement(element))
-        if let path = element.axPath {
-            lines.append("  axPath: \(path)")
-        }
-    }
-    let ocrElements = state.elements.filter { $0.source == "ocr" }
-    if !ocrElements.isEmpty {
-        lines.append("# ocr_lines:")
-        for element in ocrElements {
-            lines.append(describeElement(element))
-        }
-    }
+    lines.append("# format: tsv")
+    lines.append("# columns: \(tabularHeaderLine())")
+    lines.append(contentsOf: tabularElementBlock(modelElements(for: state), state: state))
     return lines.joined(separator: "\n") + "\n"
 }
 
-func compactStateSummary(_ state: AppState, prefix: String, options: SummaryOptions = SummaryOptions()) -> String {
+func stateSummaryHeaderLines(_ state: AppState, prefix: String, options: SummaryOptions) -> [String] {
     var lines: [String] = []
     lines.append(prefix)
     lines.append("App=\(state.bundleIdentifier ?? state.appName) (pid \(state.pid))")
@@ -1297,6 +1316,34 @@ func compactStateSummary(_ state: AppState, prefix: String, options: SummaryOpti
         let artifacts = state.textPath ?? state.statePath ?? outputRoot
         lines.append("full_element_dump: \(artifacts)")
     }
+    return lines
+}
+
+func tabularStateSummary(_ state: AppState, prefix: String, options: SummaryOptions) -> String {
+    var lines = stateSummaryHeaderLines(state, prefix: prefix, options: options)
+    let scope = summaryScopeElements(for: state, options: options)
+    let shown = summaryElements(for: state, options: options)
+    let axScopeCount = countElements(in: scope, source: "ax")
+    let ocrScopeCount = countElements(in: scope, source: "ocr")
+    let axShownCount = countElements(in: shown, source: "ax")
+    let ocrShownCount = countElements(in: shown, source: "ocr")
+    lines.append("")
+    if options.elementFilter != nil && scope.isEmpty {
+        lines.append("No elements matched element_filter.")
+        return lines.joined(separator: "\n")
+    }
+    lines.append("rows: \(shown.count) shown of \(scope.count) matched (ax \(axShownCount)/\(axScopeCount), ocr \(ocrShownCount)/\(ocrScopeCount))")
+    lines.append("format: tsv")
+    lines.append("notes: one row per AX/OCR element; center is x,y in macOS screen points; frame is x,y,w,h in macOS screen points; flags may include settable|focused|selected|overlay.")
+    lines.append(contentsOf: tabularElementBlock(shown, state: state, maxTextLength: summaryTextMaxLength))
+    return lines.joined(separator: "\n")
+}
+
+func stateSummary(_ state: AppState, prefix: String, options: SummaryOptions = SummaryOptions()) -> String {
+    if options.mode == .tsv {
+        return tabularStateSummary(state, prefix: prefix, options: options)
+    }
+    var lines = stateSummaryHeaderLines(state, prefix: prefix, options: options)
     lines.append("")
     let scope = summaryScopeElements(for: state, options: options)
     let shown = summaryElements(for: state, options: options)
@@ -1315,19 +1362,6 @@ func compactStateSummary(_ state: AppState, prefix: String, options: SummaryOpti
         let omitted = max(0, axScopeCount - axElements.count)
         if omitted > 0 {
             lines.append("... omitted \(omitted) AX elements. See full_element_dump for the complete list.")
-        }
-    }
-    if options.mode == .compact && options.elementFilter == nil {
-        let overlays = overlayElements(for: state)
-        if !overlays.isEmpty {
-            lines.append("")
-            lines.append("Overlay/search-result candidates (prioritize these before background content):")
-            for element in overlays.prefix(12) {
-                lines.append(describeElement(element, maxTextLength: summaryTextMaxLength))
-            }
-            if overlays.count > 12 {
-                lines.append("... omitted \(overlays.count - 12) overlay candidates. See full_element_dump for the complete list.")
-            }
         }
     }
     let ocrElements = shown.filter { $0.source == "ocr" }
@@ -1367,8 +1401,91 @@ func applicationBundleInfo(pid: pid_t) -> (String?, String?) {
     return (app.bundleIdentifier, app.localizedName)
 }
 
+func frontmostProcessID() -> pid_t? {
+    NSWorkspace.shared.frontmostApplication?.processIdentifier
+}
+
+@discardableResult
+func runAppleScript(lines: [String], label: String) -> Bool {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+    process.arguments = lines.flatMap { ["-e", $0] }
+    process.standardOutput = Pipe()
+    process.standardError = Pipe()
+    do {
+        try process.run()
+        process.waitUntilExit()
+    } catch {
+        fputs("warning: failed to run osascript (\(label)): \(error.localizedDescription)\n", stderr)
+        return false
+    }
+    if process.terminationStatus != 0 {
+        let stderrData = (process.standardError as? Pipe)?.fileHandleForReading.readDataToEndOfFile()
+        let stderrText = stderrData.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        fputs("warning: osascript failed (\(label)) with status \(process.terminationStatus): \(stderrText)\n", stderr)
+        return false
+    }
+    return true
+}
+
+@discardableResult
+func reopenApplication(bundleIdentifier: String?, appName: String?) -> Bool {
+    let target: String
+    if let bundleIdentifier, !bundleIdentifier.isEmpty {
+        target = "application id \"\(bundleIdentifier.replacingOccurrences(of: "\"", with: "\\\""))\""
+    } else if let appName, !appName.isEmpty {
+        target = "application \"\(appName.replacingOccurrences(of: "\"", with: "\\\""))\""
+    } else {
+        return false
+    }
+    return runAppleScript(
+        lines: [
+            "tell \(target) to reopen",
+            "tell \(target) to activate",
+        ],
+        label: "reopen app"
+    )
+}
+
+@discardableResult
+func raiseApplicationWindow(pid: pid_t) -> Bool {
+    runAppleScript(
+        lines: [
+            "tell application \"System Events\"",
+            "set targetProcess to first application process whose unix id is \(pid)",
+            "tell targetProcess",
+            "set frontmost to true",
+            "if (count of windows) > 0 then",
+            "perform action \"AXRaise\" of window 1",
+            "end if",
+            "end tell",
+            "end tell",
+        ],
+        label: "raise window for pid \(pid)"
+    )
+}
+
 func windowTitle(from traversal: ResponseData) -> String? {
     traversal.elements.first { $0.role.contains("AXWindow") && ($0.text?.isEmpty == false) }?.text
+}
+
+func hasWindowLikeElement(_ traversal: ResponseData) -> Bool {
+    traversal.elements.contains { element in
+        let role = element.role
+        return role.contains("AXWindow")
+            || role.contains("AXDialog")
+            || role.contains("AXSheet")
+            || role.contains("AXDrawer")
+            || role.contains("AXPopover")
+            || role.contains("AXWebArea")
+    }
+}
+
+func isLikelyDegradedTraversal(_ traversal: ResponseData) -> Bool {
+    if hasWindowLikeElement(traversal) || windowTitle(from: traversal) != nil {
+        return false
+    }
+    return traversal.elements.count <= 25
 }
 
 func windowFrame(from traversal: ResponseData) -> CGRect? {
@@ -1386,7 +1503,7 @@ func windowFrame(from traversal: ResponseData) -> CGRect? {
     }
 }
 
-func indexedElements(from traversal: ResponseData, pid: Int32, screenshot: ScreenshotInfo?) -> [IndexedElement] {
+func indexedElements(from traversal: ResponseData) -> [IndexedElement] {
     traversal.elements.enumerated().map { index, element in
         let screenFrame: Frame?
         if let x = element.x, let y = element.y, let width = element.width, let height = element.height {
@@ -1395,20 +1512,12 @@ func indexedElements(from traversal: ResponseData, pid: Int32, screenshot: Scree
             screenFrame = nil
         }
         let screenCenter = center(of: screenFrame)
-        let screenshotCenter: PointInfo?
-        if let screenCenter {
-            screenshotCenter = screenPointToScreenshot(CGPoint(x: screenCenter.x, y: screenCenter.y), screenshot: screenshot)
-        } else {
-            screenshotCenter = nil
-        }
         return IndexedElement(
             index: String(index),
             role: element.role,
             text: element.text,
             screenFrame: screenFrame,
-            screenshotFrame: screenFrameToScreenshot(screenFrame, screenshot: screenshot),
             screenCenter: screenCenter,
-            screenshotCenter: screenshotCenter,
             axPath: element.axPath,
             settable: element.isSettable ?? false,
             focused: element.isFocused,
@@ -1626,6 +1735,37 @@ func runningApplication(for identifier: String) -> NSRunningApplication? {
 
 final class StateManager {
     private var states: [String: AppState] = [:]
+    private var appUseSessions: [String: AppUseSession] = [:]
+
+    private func sessionKeys(requestedApp: String, bundle: String?, appName: String) -> [String] {
+        var keys = [appKey(requestedApp)]
+        if let bundleKey = bundle?.trimmingCharacters(in: .whitespacesAndNewlines), !bundleKey.isEmpty {
+            keys.append(appKey(bundleKey))
+        }
+        let normalizedName = appKey(appName)
+        if !normalizedName.isEmpty {
+            keys.append(normalizedName)
+        }
+        return Array(Set(keys))
+    }
+
+    private func latestSession(for keys: [String]) -> AppUseSession? {
+        keys.compactMap { appUseSessions[$0] }.max { $0.lastTouchedAt < $1.lastTouchedAt }
+    }
+
+    private func sessionExpired(_ session: AppUseSession, now: Double, pid: Int32) -> Bool {
+        if session.pid != pid {
+            return true
+        }
+        return now - session.lastTouchedAt > appUseSessionIdleTimeout
+    }
+
+    private func recordSession(keys: [String], pid: Int32, now: Double) {
+        let session = AppUseSession(pid: pid, lastTouchedAt: now)
+        for key in keys {
+            appUseSessions[key] = session
+        }
+    }
 
     private func state(_ state: AppState, satisfies mode: ObservationMode) -> Bool {
         switch mode {
@@ -1674,8 +1814,41 @@ final class StateManager {
         if didLaunchApp {
             try? await Task.sleep(nanoseconds: 120_000_000)
         }
+        let bundle = runningApp?.bundleIdentifier ?? applicationBundleInfo(pid: pid_t(pid)).0
+        let appName = runningApp?.localizedName ?? launchedAppName ?? app
+        let keys = sessionKeys(requestedApp: app, bundle: bundle, appName: appName)
+        let now = Date().timeIntervalSince1970
+        let shouldActivateForFreshSession: Bool
+        if let session = latestSession(for: keys) {
+            shouldActivateForFreshSession = sessionExpired(session, now: now, pid: pid)
+        } else {
+            shouldActivateForFreshSession = true
+        }
 
-        let traversal = try MacosUseSDK.traverseAccessibilityTree(pid: pid, onlyVisibleElements: true, activateApp: false)
+        func revealAppWindow(forceRaise: Bool) async {
+            runningApp?.unhide()
+            if forceRaise {
+                _ = runningApp?.activate(options: [.activateAllWindows])
+                _ = reopenApplication(bundleIdentifier: bundle, appName: appName)
+                if !raiseApplicationWindow(pid: pid_t(pid)) {
+                    _ = runningApp?.activate(options: [.activateAllWindows])
+                }
+                try? await Task.sleep(nanoseconds: 450_000_000)
+            } else if frontmostProcessID() != pid_t(pid) {
+                _ = runningApp?.activate(options: [.activateAllWindows])
+                try? await Task.sleep(nanoseconds: 180_000_000)
+            }
+        }
+
+        if shouldActivateForFreshSession {
+            await revealAppWindow(forceRaise: true)
+        }
+
+        var traversal = try MacosUseSDK.traverseAccessibilityTree(pid: pid, onlyVisibleElements: true, activateApp: false)
+        if isLikelyDegradedTraversal(traversal) {
+            await revealAppWindow(forceRaise: true)
+            traversal = try MacosUseSDK.traverseAccessibilityTree(pid: pid, onlyVisibleElements: true, activateApp: false)
+        }
         let basename = "\(nowMillis())_\(safeComponent(key))_state"
         let screenshot = captureScreenshot(
             pid: pid_t(pid),
@@ -1683,9 +1856,7 @@ final class StateManager {
             clickPoint: clickPoint,
             fallbackFrame: windowFrame(from: traversal)
         )
-        let bundle = runningApp?.bundleIdentifier ?? applicationBundleInfo(pid: pid_t(pid)).0
-        let appName = runningApp?.localizedName ?? launchedAppName ?? app
-        var elements = indexedElements(from: traversal, pid: pid, screenshot: screenshot)
+        var elements = indexedElements(from: traversal)
         var ocrPayload: OCRPayload?
         var ocrError: String?
         if observationMode.includesOCR {
@@ -1733,6 +1904,7 @@ final class StateManager {
             states[appKey(bundle)] = state
         }
         states[appKey(appName)] = state
+        recordSession(keys: keys, pid: pid, now: Date().timeIntervalSince1970)
         return state
     }
 
@@ -1907,7 +2079,7 @@ func performSecondary(action: String, element: IndexedElement, state: AppState) 
         throw TactileMCPError.invalidArgument("Unsupported secondary action \(action). Allowed: \(secondaryActionEnum.joined(separator: ", "))")
     }
     guard element.source == "ax" else {
-        throw TactileMCPError.unsupportedAction("Element \(element.index) has source=\(element.source). OCR elements do not support secondary AX actions; use click, scroll, type_text, or raw screenshot coordinates instead.")
+        throw TactileMCPError.unsupportedAction("Element \(element.index) has source=\(element.source). OCR elements do not support secondary AX actions; use click, scroll, type_text, or macOS screen-point coordinates instead.")
     }
     guard let path = element.axPath else {
         throw TactileMCPError.elementNotFound("Element \(element.index) has no axPath")
@@ -1992,50 +2164,41 @@ func handleToolCall(_ name: String, arguments: [String: Value]?) async throws ->
             ocrLanguages: languages,
             ocrRecognitionLevel: recognitionLevel
         )
-        return toolContent(text: compactStateSummary(state, prefix: "Succeeded. Returned app state and screenshot.", options: summaryOptions), state: state)
+        return toolContent(text: stateSummary(state, prefix: "Succeeded. Returned app state and screenshot.", options: summaryOptions), state: state)
 
     case "click":
         let app = try getRequiredString(from: arguments, key: "app")
         if try getOptionalString(from: arguments, key: "element_index") != nil {
-            throw MCPError.invalidParams("click only accepts coordinate inputs. Use x/y screenshot pixels or screen_x/screen_y macOS screen points. For AX elements, use perform_secondary_action instead.")
+            throw MCPError.invalidParams("click only accepts coordinate inputs. Use x/y macOS screen points. For AX elements, use perform_secondary_action instead.")
+        }
+        if arguments?["coordinate_space"] != nil || arguments?["screen_x"] != nil || arguments?["screen_y"] != nil {
+            throw MCPError.invalidParams("click no longer accepts coordinate_space, screen_x, or screen_y. Use x and y as macOS screen points.")
+        }
+        let x = try getOptionalDouble(from: arguments, key: "x")
+        let y = try getOptionalDouble(from: arguments, key: "y")
+        guard let x, let y else {
+            throw MCPError.invalidParams("click requires x and y macOS screen-point coordinates")
         }
         let state = try await stateManager.state(for: app)
-        let point: CGPoint
-        let screenX = try getOptionalDouble(from: arguments, key: "screen_x")
-        let screenY = try getOptionalDouble(from: arguments, key: "screen_y")
-        if screenX != nil || screenY != nil {
-            guard let screenX, let screenY else {
-                throw MCPError.invalidParams("click requires both screen_x and screen_y when either is supplied")
-            }
-            point = CGPoint(x: screenX, y: screenY)
-        } else {
-            let x = try getRequiredDouble(from: arguments, key: "x")
-            let y = try getRequiredDouble(from: arguments, key: "y")
-            let coordinateSpace = try parseCoordinateSpace(try getOptionalString(from: arguments, key: "coordinate_space"))
-            if coordinateSpace == "screen" {
-                point = CGPoint(x: x, y: y)
-            } else {
-                point = screenshotPointToScreen(x, y, state: state)
-            }
-        }
+        let point = CGPoint(x: x, y: y)
         let button = try getOptionalString(from: arguments, key: "mouse_button") ?? "left"
         let count = try getOptionalInt(from: arguments, key: "click_count") ?? 1
         NSRunningApplication(processIdentifier: pid_t(state.pid))?.activate(options: [])
         try? await Task.sleep(nanoseconds: 100_000_000)
         try performRawClick(at: point, button: button, count: count)
         let refreshed = try await stateManager.refreshAfterAction(app: app, clickPoint: point)
-        return toolContent(text: compactStateSummary(refreshed, prefix: "Succeeded. Returned refreshed app state and screenshot."), state: refreshed)
+        return toolContent(text: stateSummary(refreshed, prefix: "Succeeded. Returned refreshed app state and screenshot."), state: refreshed)
 
     case "perform_secondary_action":
         let app = try getRequiredString(from: arguments, key: "app")
         let index = try getRequiredString(from: arguments, key: "element_index")
         let action = try getRequiredString(from: arguments, key: "action")
         if index.lowercased().hasPrefix("o") {
-            throw TactileMCPError.unsupportedAction("Element \(index) has source=ocr. OCR elements do not support secondary AX actions; use click, scroll, type_text, or raw screenshot coordinates instead.")
+            throw TactileMCPError.unsupportedAction("Element \(index) has source=ocr. OCR elements do not support secondary AX actions; use click, scroll, type_text, or macOS screen-point coordinates instead.")
         }
         let pair = try await stateManager.element(app: app, index: index, observationMode: .ax)
         guard pair.1.source == "ax" else {
-            throw TactileMCPError.unsupportedAction("Element \(index) has source=\(pair.1.source). OCR elements do not support secondary AX actions; use click, scroll, type_text, or raw screenshot coordinates instead.")
+            throw TactileMCPError.unsupportedAction("Element \(index) has source=\(pair.1.source). OCR elements do not support secondary AX actions; use click, scroll, type_text, or macOS screen-point coordinates instead.")
         }
         var actionState = pair.0
         var actionElement = pair.1
@@ -2062,7 +2225,7 @@ func handleToolCall(_ name: String, arguments: [String: Value]?) async throws ->
             }
         }
         let refreshed = try await stateManager.refreshAfterAction(app: app, observationMode: .ax)
-        return toolContent(text: compactStateSummary(refreshed, prefix: "Succeeded. Returned refreshed app state."), state: refreshed)
+        return toolContent(text: stateSummary(refreshed, prefix: "Succeeded. Returned refreshed app state."), state: refreshed)
 
     case "set_value":
         throw TactileMCPError.unsupportedAction("set_value is disabled. Use click or perform_secondary_action to focus an element, then use type_text or press_key for text input.")
@@ -2097,34 +2260,31 @@ func handleToolCall(_ name: String, arguments: [String: Value]?) async throws ->
             }
         } else {
             guard let x, let y else {
-                throw TactileMCPError.invalidArgument("scroll requires either element_index or both x and y screenshot pixel coordinates")
+                throw TactileMCPError.invalidArgument("scroll requires either element_index or both x and y macOS screen-point coordinates")
             }
-            let state = try await stateManager.state(for: app)
-            let point = screenshotPointToScreen(x, y, state: state)
+            let point = CGPoint(x: x, y: y)
             scrollPoint = point
             let (dy, dx) = try scrollDelta(direction: direction, pages: pages)
             try performCoordinateScroll(at: point, deltaY: dy, deltaX: dx)
         }
         let refreshed = try await stateManager.refreshAfterAction(app: app, clickPoint: scrollPoint)
-        return toolContent(text: compactStateSummary(refreshed, prefix: "Succeeded. Returned refreshed app state."), state: refreshed)
+        return toolContent(text: stateSummary(refreshed, prefix: "Succeeded. Returned refreshed app state."), state: refreshed)
 
     case "drag":
         let app = try getRequiredString(from: arguments, key: "app")
         let state = try await stateManager.state(for: app)
-        let start = screenshotPointToScreen(
-            try getRequiredDouble(from: arguments, key: "from_x"),
-            try getRequiredDouble(from: arguments, key: "from_y"),
-            state: state
+        let start = CGPoint(
+            x: try getRequiredDouble(from: arguments, key: "from_x"),
+            y: try getRequiredDouble(from: arguments, key: "from_y")
         )
-        let end = screenshotPointToScreen(
-            try getRequiredDouble(from: arguments, key: "to_x"),
-            try getRequiredDouble(from: arguments, key: "to_y"),
-            state: state
+        let end = CGPoint(
+            x: try getRequiredDouble(from: arguments, key: "to_x"),
+            y: try getRequiredDouble(from: arguments, key: "to_y")
         )
         NSRunningApplication(processIdentifier: pid_t(state.pid))?.activate(options: [])
         try performDrag(from: start, to: end)
         let refreshed = try await stateManager.refreshAfterAction(app: app)
-        return toolContent(text: compactStateSummary(refreshed, prefix: "Succeeded. Returned refreshed app state."), state: refreshed)
+        return toolContent(text: stateSummary(refreshed, prefix: "Succeeded. Returned refreshed app state."), state: refreshed)
 
     case "press_key":
         let app = try getRequiredString(from: arguments, key: "app")
@@ -2134,7 +2294,7 @@ func handleToolCall(_ name: String, arguments: [String: Value]?) async throws ->
         try? await Task.sleep(nanoseconds: 80_000_000)
         try pressKeyCombo(key)
         let refreshed = try await stateManager.refreshAfterAction(app: app)
-        return toolContent(text: compactStateSummary(refreshed, prefix: "Succeeded. Returned refreshed app state."), state: refreshed)
+        return toolContent(text: stateSummary(refreshed, prefix: "Succeeded. Returned refreshed app state."), state: refreshed)
 
     case "type_text":
         let app = try getRequiredString(from: arguments, key: "app")
@@ -2147,7 +2307,7 @@ func handleToolCall(_ name: String, arguments: [String: Value]?) async throws ->
             try pasteTextWithClipboard(text)
         }
         let refreshed = try await stateManager.refreshAfterAction(app: app)
-        return toolContent(text: compactStateSummary(refreshed, prefix: "Succeeded. Returned refreshed app state."), state: refreshed)
+        return toolContent(text: stateSummary(refreshed, prefix: "Succeeded. Returned refreshed app state."), state: refreshed)
 
     default:
         throw MCPError.methodNotFound(name)
@@ -2167,28 +2327,25 @@ func computerUseTools() -> [Tool] {
         ),
         Tool(
             name: "get_app_state",
-            description: "Start an app use session if needed, then get the state of the app's key window. observation_mode defaults to ax_ocr, returning Accessibility elements plus local OCRLine elements. The default summary is compact and keeps full state in /tmp/tactile-macos-mcp; use summary_mode=full or element_filter for more detail.",
+            description: "Start an app use session if needed, then get the state of the app's key window. A fresh app-use session foregrounds the target app once and raises its first visible window when possible; if the first AX traversal is still degraded, the server retries one recovery raise before returning state. Later observations reuse the running app without re-activating it. observation_mode defaults to ax_ocr, returning Accessibility elements plus local OCRLine elements. Use observation_mode=ax_ocr_visual when the caller needs screenshot-based semantic understanding, such as chat-message chronology, bubble ownership, or recalled-message context. The default summary is tsv and keeps full state in /tmp/tactile-macos-mcp; use summary_mode=full for the old verbose element listing, summary_mode=metadata for paths only, or element_filter for a smaller focused result.",
             inputSchema: schema([
                 "app": prop("string", "App name or bundle identifier"),
                 "observation_mode": prop("string", "Observation mode. Defaults to ax_ocr. ax returns Accessibility elements only. ax_ocr also runs local macOS Vision OCR and appends OCRLine elements. ax_ocr_visual additionally attaches the screenshot image to the MCP result.", enumValues: observationModeEnum),
                 "ocr_languages": prop("string", "Comma-separated macOS Vision OCR languages. Defaults to zh-Hans,en-US."),
                 "ocr_recognition_level": prop("string", "macOS Vision OCR recognition level. Defaults to accurate.", enumValues: ocrRecognitionLevelEnum),
-                "summary_mode": prop("string", "Summary verbosity. Defaults to compact. compact returns prioritized controls/text, full returns all matching elements, metadata omits element listings. Full untruncated state is always written to /tmp/tactile-macos-mcp.", enumValues: summaryModeEnum),
-                "element_limit": prop("integer", "Maximum elements to include in the returned summary. Defaults to 80 for compact and unlimited for full."),
+                "summary_mode": prop("string", "Summary format/verbosity. Defaults to tsv. full returns the old verbose all-element listing, metadata omits element listings, and tsv returns a structured one-row-per-element table across AX and OCR. Full untruncated state is always written to /tmp/tactile-macos-mcp.", enumValues: summaryModeEnum),
+                "element_limit": prop("integer", "Maximum elements to include in the returned summary. Defaults to unlimited for full or tsv."),
                 "element_filter": prop("string", elementFilterDescription),
             ], required: ["app"]),
             annotations: readOnly
         ),
         Tool(
             name: "click",
-            description: "Click coordinate-backed targets only. Use x/y for screenshot pixel coordinates, or screen_x/screen_y for macOS screen points. This tool does not accept AX element_index input; for AX element operations, use perform_secondary_action.",
+            description: "Click coordinate-backed targets only. Use x/y macOS screen points. This tool does not accept AX element_index input; for AX element operations, use perform_secondary_action.",
             inputSchema: schema([
                 "app": prop("string", "App name or bundle identifier"),
-                "x": prop("number", "X coordinate. Defaults to screenshot pixel coordinates unless coordinate_space is screen."),
-                "y": prop("number", "Y coordinate. Defaults to screenshot pixel coordinates unless coordinate_space is screen."),
-                "coordinate_space": prop("string", "Coordinate space for x/y. Defaults to screenshot.", enumValues: coordinateSpaceEnum),
-                "screen_x": prop("number", "X coordinate in macOS screen points. Overrides x/coordinate_space when paired with screen_y."),
-                "screen_y": prop("number", "Y coordinate in macOS screen points. Overrides y/coordinate_space when paired with screen_x."),
+                "x": prop("number", "X coordinate in macOS screen points."),
+                "y": prop("number", "Y coordinate in macOS screen points."),
                 "mouse_button": prop("string", "Mouse button to click. Defaults to left.", enumValues: ["left", "right", "middle"]),
                 "click_count": prop("integer", "Number of clicks. Defaults to 1"),
             ], required: ["app"]),
@@ -2216,12 +2373,12 @@ func computerUseTools() -> [Tool] {
         ),
         Tool(
             name: "scroll",
-            description: "Scroll an element or screenshot pixel coordinate in a direction by a number of pages.",
+            description: "Scroll an element or macOS screen coordinate in a direction by a number of pages.",
             inputSchema: schema([
                 "app": prop("string", "App name or bundle identifier"),
                 "element_index": prop("string", "Element identifier"),
-                "x": prop("number", "X coordinate in screenshot pixel coordinates"),
-                "y": prop("number", "Y coordinate in screenshot pixel coordinates"),
+                "x": prop("number", "X coordinate in macOS screen points"),
+                "y": prop("number", "Y coordinate in macOS screen points"),
                 "direction": prop("string", "Scroll direction: up, down, left, or right"),
                 "pages": prop("number", "Number of pages to scroll. Fractional values are supported. Defaults to 1"),
             ], required: ["app", "direction"]),
@@ -2229,7 +2386,7 @@ func computerUseTools() -> [Tool] {
         ),
         Tool(
             name: "drag",
-            description: "Drag from one point to another using pixel coordinates from the latest screenshot.",
+            description: "Drag from one macOS screen point to another.",
             inputSchema: schema([
                 "app": prop("string", "App name or bundle identifier"),
                 "from_x": prop("number", "Start X coordinate"),
@@ -2266,7 +2423,7 @@ func setupAndStartServer() async throws -> Server {
         name: "tactile-macos-mcp",
         version: "0.1.0",
         instructions: """
-        Computer Use style tools for macOS apps. Begin with get_app_state before action tools. For AX elements, use perform_secondary_action. click is coordinate-only and should be used for OCRLine or other visual/coordinate-backed targets, with OCRLine targets preferred over raw visual coordinates when both are available. get_app_state defaults to observation_mode=ax_ocr and summary_mode=compact, returning prioritized Accessibility/OCR elements while writing the full untruncated state and screenshots to /tmp/tactile-macos-mcp. Use element_filter to retrieve a small focused summary, summary_mode=metadata for paths only, summary_mode=full for the old full element listing, ax for AX-only speed/privacy, or ax_ocr_visual to also attach the screenshot for visual reasoning by the calling model. element_filter is a case-insensitive regex over element index/source/role/text/AX path/state/actions; use plain text for one target and regex OR like "search|搜索|输入|联系人|张仲岳" for multiple terms. element_filter only narrows get_app_state output and does not type into or search inside the app. If the expected target is missing, increase element_limit, use summary_mode=full, or inspect the full_element_dump path before taking action. Element output labels Accessibility coordinates as screenFrame/screenCenter and screenshot pixels as screenshotFrame/screenshotCenter. Raw click x/y defaults to screenshot pixel coordinates from the latest screenshot, but click also accepts coordinate_space=screen or screen_x/screen_y for macOS screen points. Scroll and drag raw coordinates remain screenshot pixels.
+        Computer Use style tools for macOS apps. Begin with get_app_state before action tools. For AX elements, use perform_secondary_action. click is coordinate-only and should be used for OCRLine or other visual/coordinate-backed targets, with OCRLine targets preferred over raw visual coordinates when both are available. All tool coordinates use macOS screen points with a top-left origin, including click x/y, scroll x/y, drag from_x/from_y/to_x/to_y, AX screenFrame/screenCenter, and OCRLine screenFrame/screenCenter. A fresh get_app_state observation foregrounds the target app once when starting a new app-use session and tries to raise its first visible window; if the first AX traversal still looks degraded, the server retries one recovery raise before returning state. Later observations reuse the running app without re-activating it so popovers or transient windows are less likely to collapse. get_app_state defaults to observation_mode=ax_ocr and summary_mode=tsv, returning one structured row per AX/OCR element while writing the full untruncated state and screenshots to /tmp/tactile-macos-mcp. Use ax_ocr_visual when the task requires screenshot-level semantic understanding, especially for chat timelines, latest-message reading, sender-vs-recipient bubble ownership, or recalled-message context. In those cases, use the screenshot to understand chronology and message ownership, then use AX/OCR rows to find the concrete controls. Use element_filter to retrieve a smaller focused subset, summary_mode=metadata for paths only, summary_mode=full for the old verbose full element listing, ax for AX-only speed/privacy, or ax_ocr_visual to also attach the screenshot for visual reasoning by the calling model. element_filter is a case-insensitive regex over element index/source/role/text/AX path/state/actions; use plain text for one target and regex OR like "search|搜索|输入|联系人|张仲岳" for multiple terms. element_filter only narrows get_app_state output and does not type into or search inside the app. If the expected target is missing, increase element_limit, use summary_mode=tsv, or inspect the full_element_dump path before taking action.
         """,
         capabilities: .init(tools: .init(listChanged: false))
     )
