@@ -4,13 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -20,6 +23,17 @@ LEGACY_WORKFLOW_PATH = WORKFLOW_DIR / "codex_llm_workflow.py"
 PROJECT_ROOT = WORKFLOW_DIR.parents[3]
 MCP_ROOT = PROJECT_ROOT / "mcps" / "tactile-macos-mcp"
 MCP_SERVER = MCP_ROOT / "bin" / "tactile-macos-mcp"
+
+
+@dataclass(frozen=True)
+class WorkflowStage:
+    name: str
+    instruction: str
+    target: str | None = None
+    expects_share_text: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
 
 
 def load_legacy_workflow():
@@ -34,11 +48,65 @@ def load_legacy_workflow():
 
 legacy = load_legacy_workflow()
 
+MCP_SECONDARY_ACTIONS = {
+    "Press",
+    "Raise",
+    "ShowMenu",
+    "Confirm",
+    "Cancel",
+    "Increment",
+    "Decrement",
+    "Focus",
+    "Select",
+    "Deselect",
+    "ScrollUp",
+    "ScrollDown",
+    "ScrollLeft",
+    "ScrollRight",
+}
+EXTENDED_ACTION_TYPES = set(legacy.ALLOWED_ACTION_TYPES) | {"secondary_action", "drag"}
+
 
 DEFAULT_LLM_MODEL = os.getenv("TACTILE_MODEL", "gpt-5.5")
 LLM_TIMEOUT_SECONDS = float(os.getenv("TACTILE_LLM_TIMEOUT", "600"))
 LLM_MAX_RETRIES = int(os.getenv("TACTILE_LLM_MAX_RETRIES", "3"))
 MCP_TIMEOUT_SECONDS = float(os.getenv("TACTILE_MCP_TIMEOUT", "20"))
+PRECISE_SCROLL_PAGES = float(os.getenv("TACTILE_PRECISE_SCROLL_PAGES", "0.2"))
+COLLECTION_ALIGNMENT_MAX_ATTEMPTS = int(os.getenv("TACTILE_COLLECTION_ALIGNMENT_MAX_ATTEMPTS", "12"))
+COLLECTION_DRAG_MIN_POINTS = float(os.getenv("TACTILE_COLLECTION_DRAG_MIN_POINTS", "18"))
+COLLECTION_DRAG_PROBE_RATIO = float(os.getenv("TACTILE_COLLECTION_DRAG_PROBE_RATIO", "0.32"))
+COLLECTION_VALUE_PROBE_RATIO = float(os.getenv("TACTILE_COLLECTION_VALUE_PROBE_RATIO", "0.6"))
+COLLECTION_DRAG_MAX_RATIO = float(os.getenv("TACTILE_COLLECTION_DRAG_MAX_RATIO", "0.9"))
+COLLECTION_DRAG_MAX_POINTS = float(os.getenv("TACTILE_COLLECTION_DRAG_MAX_POINTS", "280"))
+COLLECTION_DRAG_OVERSHOOT_RATIO = float(os.getenv("TACTILE_COLLECTION_DRAG_OVERSHOOT_RATIO", "1.1"))
+OPEN_COLLECTION_CONTAINER_ROLES = {
+    "AXList",
+    "AXMenu",
+    "AXTable",
+    "AXOutline",
+    "AXBrowser",
+    "AXScrollArea",
+    "AXScrollBar",
+}
+OPEN_COLLECTION_TRIGGER_ROLES = {
+    "AXMenuButton",
+    "AXPopUpButton",
+    "AXComboBox",
+}
+OPEN_COLLECTION_VALUE_SOURCE_ROLES = OPEN_COLLECTION_TRIGGER_ROLES | {
+    "AXTextField",
+}
+OPEN_COLLECTION_OPTION_ROLES = {
+    "AXMenuItem",
+    "AXRow",
+    "AXCell",
+    "AXButton",
+    "AXRadioButton",
+    "AXCheckBox",
+    "AXStaticText",
+}
+OPEN_COLLECTION_AUGMENT_LIMIT = 96
+VISIBLE_OPTION_SELECTOR_CANDIDATE_LIMIT = 72
 
 
 class MCPClient:
@@ -258,6 +326,961 @@ def _mcp_call_succeeded(result: dict[str, Any], text: str) -> bool:
     return not text.lstrip().startswith("Refused.")
 
 
+def _requested_visual_planning_for_profile(requested_mode: str, profile: legacy.AppProfile) -> str:
+    if requested_mode == "off" and profile.fixed_strategy and profile.workflow_mode == "ax-poor":
+        return "auto"
+    return requested_mode
+
+
+def _normalize_secondary_action_name(name: str | None) -> str:
+    cleaned = str(name or "").strip()
+    if cleaned.startswith("AX") and len(cleaned) > 2:
+        return cleaned[2:]
+    return cleaned
+
+
+def _frame_tuple_from_mapping(frame: Any) -> tuple[float, float, float, float] | None:
+    if not isinstance(frame, dict):
+        return None
+    try:
+        x = float(frame["x"])
+        y = float(frame["y"])
+        width = float(frame["width"])
+        height = float(frame["height"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return (x, y, width, height)
+
+
+def _frame_tuple_from_summary_element(element: dict[str, Any]) -> tuple[float, float, float, float] | None:
+    return _frame_tuple_from_mapping(element.get("frame"))
+
+
+def _frame_tuple_from_raw_ax_item(item: dict[str, Any]) -> tuple[float, float, float, float] | None:
+    return _frame_tuple_from_mapping(item.get("screenFrame") or item.get("screen_frame"))
+
+
+def _frame_center(frame: tuple[float, float, float, float]) -> tuple[float, float]:
+    x, y, width, height = frame
+    return (x + width / 2.0, y + height / 2.0)
+
+
+def _frame_distance(frame_a: tuple[float, float, float, float], frame_b: tuple[float, float, float, float]) -> float:
+    ax, ay = _frame_center(frame_a)
+    bx, by = _frame_center(frame_b)
+    return abs(ax - bx) + abs(ay - by)
+
+
+def _frame_contains_with_margin(
+    container: tuple[float, float, float, float],
+    frame: tuple[float, float, float, float],
+    *,
+    margin_x: float = 56.0,
+    margin_y: float = 56.0,
+) -> bool:
+    px, py = _frame_center(frame)
+    x, y, width, height = container
+    return x - margin_x <= px <= x + width + margin_x and y - margin_y <= py <= y + height + margin_y
+
+
+def _element_base_role_from_summary(element: dict[str, Any]) -> str:
+    return legacy.base_role(str(element.get("role") or ""))
+
+
+def _element_base_role_from_raw_ax(item: dict[str, Any]) -> str:
+    return legacy.base_role(str(item.get("role") or ""))
+
+
+def _is_open_collection_container_role(role_base: str, frame: tuple[float, float, float, float] | None) -> bool:
+    if role_base in OPEN_COLLECTION_CONTAINER_ROLES:
+        return True
+    if role_base == "AXWindow" and frame is not None:
+        _, _, width, height = frame
+        return width <= 360 and height <= 680
+    return False
+
+
+def _is_open_collection_option_role(role_base: str) -> bool:
+    return role_base in OPEN_COLLECTION_OPTION_ROLES
+
+
+def _next_ax_element_id(index: dict[str, legacy.UiElement]) -> str:
+    next_id = max((int(key[1:]) for key in index if key.startswith("e") and key[1:].isdigit()), default=-1) + 1
+    return f"e{next_id}"
+
+
+def _normalized_secondary_actions(actions: Any) -> list[str]:
+    if not isinstance(actions, list):
+        return []
+    return [
+        normalized
+        for action in actions
+        if (normalized := _normalize_secondary_action_name(action))
+    ]
+
+
+def _collection_child_order(ax_path: str | None, container_ax_path: str | None) -> int | None:
+    if not ax_path or not container_ax_path:
+        return None
+    prefix = f"{container_ax_path}.children["
+    if not ax_path.startswith(prefix):
+        return None
+    suffix = ax_path[len(prefix) :]
+    digits: list[str] = []
+    for ch in suffix:
+        if ch.isdigit():
+            digits.append(ch)
+            continue
+        break
+    if not digits:
+        return None
+    if len(suffix) <= len(digits) or suffix[len(digits)] != "]":
+        return None
+    try:
+        return int("".join(digits))
+    except ValueError:
+        return None
+
+
+def _collection_container_for_ax_path(ax_path: str | None, containers: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not ax_path:
+        return None
+    best: dict[str, Any] | None = None
+    best_length = -1
+    for container in containers:
+        container_ax_path = container.get("ax_path")
+        if not isinstance(container_ax_path, str) or not container_ax_path:
+            continue
+        if ax_path == container_ax_path:
+            return container
+        if ax_path.startswith(f"{container_ax_path}.children[") and len(container_ax_path) > best_length:
+            best = container
+            best_length = len(container_ax_path)
+    return best
+
+
+def _collection_membership_from_frame(
+    frame: tuple[float, float, float, float] | None,
+    containers: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if frame is None:
+        return None
+    for container in containers:
+        if _frame_contains_with_margin(container["frame"], frame):
+            return container
+    return None
+
+
+def _collection_metadata_for_candidate(
+    *,
+    ax_path: str | None,
+    frame: tuple[float, float, float, float] | None,
+    containers: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    container = _collection_container_for_ax_path(ax_path, containers)
+    if container is None:
+        container = _collection_membership_from_frame(frame, containers)
+    if container is None:
+        return None
+    container_ax_path = container.get("ax_path")
+    order = _collection_child_order(ax_path, container_ax_path) if isinstance(container_ax_path, str) else None
+    visible_in_viewport = bool(frame is not None and _frame_contains_with_margin(container["frame"], frame, margin_x=8.0, margin_y=8.0))
+    return {
+        "container_ax_path": container_ax_path,
+        "container_role": container.get("role") or container.get("role_base"),
+        "container_frame": container.get("frame"),
+        "order": order,
+        "visible_in_viewport": visible_in_viewport,
+    }
+
+
+def _collection_container_records_from_raw_ax(raw_ax_elements: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    containers: list[dict[str, Any]] = []
+    for item in raw_ax_elements:
+        if not isinstance(item, dict) or item.get("source") != "ax":
+            continue
+        frame = _frame_tuple_from_raw_ax_item(item)
+        role_base = _element_base_role_from_raw_ax(item)
+        if not _is_open_collection_container_role(role_base, frame):
+            continue
+        if frame is None:
+            continue
+        containers.append(
+            {
+                "role_base": role_base,
+                "role": str(item.get("role") or ""),
+                "text": legacy.clean_text(item.get("text"), limit=240),
+                "frame": frame,
+                "ax_path": legacy.clean_text(item.get("axPath") or item.get("ax_path"), limit=1000),
+            }
+        )
+    return containers
+
+
+def _collection_container_records_from_elements(
+    elements: list[dict[str, Any]],
+    *,
+    preferred_element_id: str | None = None,
+    element_index: dict[str, legacy.UiElement] | None = None,
+) -> list[dict[str, Any]]:
+    preferred: list[dict[str, Any]] = []
+    others: list[dict[str, Any]] = []
+    for element in elements:
+        if not isinstance(element, dict):
+            continue
+        frame = _frame_tuple_from_summary_element(element)
+        role_base = _element_base_role_from_summary(element)
+        if not _is_open_collection_container_role(role_base, frame):
+            continue
+        if frame is None:
+            continue
+        record = {
+            "id": element.get("id"),
+            "source": element.get("source"),
+            "role": element.get("role"),
+            "direct_ax": element.get("direct_ax"),
+            "role_base": role_base,
+            "text": legacy.clean_text(element.get("text"), limit=240),
+            "frame": frame,
+            "ax_path": (
+                element_index.get(str(element.get("id") or "")).ax_path
+                if element_index and isinstance(element_index.get(str(element.get("id") or "")), legacy.UiElement)
+                else None
+            ),
+        }
+        if preferred_element_id and str(element.get("id") or "") == preferred_element_id:
+            preferred.append(record)
+        else:
+            others.append(record)
+    return preferred + others
+
+
+def _is_candidate_near_any_collection(
+    candidate_frame: tuple[float, float, float, float],
+    containers: list[dict[str, Any]],
+) -> bool:
+    return any(_frame_contains_with_margin(container["frame"], candidate_frame) for container in containers)
+
+
+def _collection_option_sort_key(element: dict[str, Any], containers: list[dict[str, Any]]) -> tuple[float, float, float, float]:
+    role_base = _element_base_role_from_summary(element)
+    role_priority = {
+        "AXMenuItem": 0.0,
+        "AXRow": 1.0,
+        "AXCell": 1.0,
+        "AXButton": 2.0,
+        "AXRadioButton": 2.0,
+        "AXCheckBox": 2.0,
+        "AXStaticText": 3.0,
+    }.get(role_base, 4.0)
+    frame = _frame_tuple_from_summary_element(element) or (0.0, 0.0, 1.0, 1.0)
+    min_distance = min((_frame_distance(frame, container["frame"]) for container in containers), default=0.0)
+    x, y, _, _ = frame
+    visible_rank = 0.0 if element.get("collection_visible_in_viewport") else 1.0
+    order_rank = float(element.get("collection_order")) if element.get("collection_order") is not None else 1_000_000.0
+    return (visible_rank, role_priority, order_rank, min_distance + abs(y) + abs(x))
+
+
+def _annotate_existing_ax_elements_with_collection_metadata(
+    ax_elements: list[dict[str, Any]],
+    element_index: dict[str, legacy.UiElement],
+    containers: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    container_ids_by_path = {
+        ui_element.ax_path: element.get("id")
+        for element in ax_elements
+        if isinstance(element, dict)
+        for ui_element in [element_index.get(str(element.get("id") or ""))]
+        if isinstance(ui_element, legacy.UiElement) and ui_element.ax_path
+    }
+    annotated: list[dict[str, Any]] = []
+    for element in ax_elements:
+        if not isinstance(element, dict):
+            continue
+        updated = dict(element)
+        ui_element = element_index.get(str(element.get("id") or ""))
+        ax_path = ui_element.ax_path if isinstance(ui_element, legacy.UiElement) else None
+        frame = _frame_tuple_from_summary_element(element)
+        metadata = _collection_metadata_for_candidate(ax_path=ax_path, frame=frame, containers=containers)
+        if metadata is not None:
+            updated["collection_container_ax_path"] = metadata["container_ax_path"]
+            updated["collection_container_role"] = metadata["container_role"]
+            updated["collection_order"] = metadata["order"]
+            updated["collection_visible_in_viewport"] = metadata["visible_in_viewport"]
+            if metadata["container_ax_path"] in container_ids_by_path:
+                updated["collection_container_element_id"] = container_ids_by_path[metadata["container_ax_path"]]
+        annotated.append(updated)
+    return annotated
+
+
+def _augment_ax_elements_with_collection_candidates(
+    ax_elements: list[dict[str, Any]],
+    element_index: dict[str, legacy.UiElement],
+    raw_ax_elements: list[dict[str, Any]],
+    *,
+    max_additional: int = OPEN_COLLECTION_AUGMENT_LIMIT,
+) -> list[dict[str, Any]]:
+    containers = _collection_container_records_from_raw_ax(raw_ax_elements)
+    if not containers:
+        return ax_elements
+    ax_elements = _annotate_existing_ax_elements_with_collection_metadata(ax_elements, element_index, containers)
+    container_ids_by_path = {
+        ui_element.ax_path: element.get("id")
+        for element in ax_elements
+        if isinstance(element, dict)
+        for ui_element in [element_index.get(str(element.get("id") or ""))]
+        if isinstance(ui_element, legacy.UiElement) and ui_element.ax_path
+    }
+    existing_paths = {
+        ui_element.ax_path
+        for ui_element in element_index.values()
+        if isinstance(ui_element, legacy.UiElement) and ui_element.ax_path
+    }
+    candidates: list[dict[str, Any]] = []
+    for item in raw_ax_elements:
+        if not isinstance(item, dict) or item.get("source") != "ax":
+            continue
+        ax_path = legacy.clean_text(item.get("axPath") or item.get("ax_path"), limit=1000)
+        if not ax_path or ax_path in existing_paths:
+            continue
+        frame = _frame_tuple_from_raw_ax_item(item)
+        role_base = _element_base_role_from_raw_ax(item)
+        if not _is_open_collection_option_role(role_base):
+            continue
+        text = legacy.clean_text(item.get("text"), limit=240)
+        if not text:
+            continue
+        metadata = _collection_metadata_for_candidate(ax_path=ax_path, frame=frame, containers=containers)
+        if metadata is None:
+            continue
+        secondary_actions = _normalized_secondary_actions(item.get("secondaryActions") or item.get("secondary_actions"))
+        candidates.append(
+            {
+                "role_base": role_base,
+                "role": str(item.get("role") or ""),
+                "text": text,
+                "frame": frame,
+                "ax_path": ax_path,
+                "secondary_actions": secondary_actions,
+                "collection_container_ax_path": metadata["container_ax_path"],
+                "collection_container_role": metadata["container_role"],
+                "collection_order": metadata["order"],
+                "collection_visible_in_viewport": metadata["visible_in_viewport"],
+                "collection_container_element_id": container_ids_by_path.get(metadata["container_ax_path"]),
+            }
+        )
+    if not candidates:
+        return ax_elements
+    candidates.sort(
+        key=lambda item: (
+            0 if item.get("collection_visible_in_viewport") else 1,
+            {
+                "AXMenuItem": 0,
+                "AXRow": 1,
+                "AXCell": 1,
+                "AXButton": 2,
+                "AXRadioButton": 2,
+                "AXCheckBox": 2,
+                "AXStaticText": 3,
+            }.get(item["role_base"], 4),
+            item.get("collection_order") if item.get("collection_order") is not None else 1_000_000,
+            min((_frame_distance(item["frame"], container["frame"]) for container in containers), default=0.0)
+            if item.get("frame") is not None else 1_000_000,
+        )
+    )
+    augmented = list(ax_elements)
+    for candidate in candidates[:max_additional]:
+        element_id = _next_ax_element_id(element_index)
+        x, y, width, height = candidate["frame"]
+        ui_element = legacy.UiElement(
+            element_id=element_id,
+            role=candidate["role"],
+            text=candidate["text"],
+            x=x,
+            y=y,
+            width=width,
+            height=height,
+            ax_path=candidate["ax_path"],
+        )
+        element_index[element_id] = ui_element
+        summary_element = {
+            "id": element_id,
+            "source": "ax",
+            "role": candidate["role"],
+            "text": candidate["text"],
+            "direct_ax": True,
+            "frame": {"x": x, "y": y, "width": width, "height": height},
+            "center": {"x": ui_element.center[0], "y": ui_element.center[1]},
+            "collection_container_ax_path": candidate.get("collection_container_ax_path"),
+            "collection_container_role": candidate.get("collection_container_role"),
+            "collection_order": candidate.get("collection_order"),
+            "collection_visible_in_viewport": candidate.get("collection_visible_in_viewport"),
+            "collection_container_element_id": candidate.get("collection_container_element_id"),
+        }
+        if candidate["secondary_actions"]:
+            summary_element["secondary_actions"] = candidate["secondary_actions"]
+        augmented.append(summary_element)
+    return augmented
+
+
+def _is_collection_navigation_action(action: dict[str, Any], element_index: dict[str, legacy.UiElement]) -> bool:
+    action_type = str(action.get("type") or "").lower()
+    if action_type == "scroll":
+        return True
+    if action_type == "secondary_action":
+        secondary_action = _normalize_secondary_action_name(action.get("action"))
+        return secondary_action in {"ScrollUp", "ScrollDown", "ScrollLeft", "ScrollRight", "Increment", "Decrement"}
+    if action_type == "click":
+        element_id = action.get("element_id")
+        if not element_id:
+            return False
+        element = element_index.get(str(element_id))
+        if element is None:
+            return False
+        role_base = legacy.base_role(element.role)
+        return role_base in OPEN_COLLECTION_CONTAINER_ROLES or role_base in OPEN_COLLECTION_TRIGGER_ROLES
+    return False
+
+
+def _visible_option_candidates_for_plan(
+    elements: list[dict[str, Any]],
+    element_index: dict[str, legacy.UiElement],
+    plan: dict[str, Any],
+    *,
+    limit: int = VISIBLE_OPTION_SELECTOR_CANDIDATE_LIMIT,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    actions = plan.get("actions") or []
+    first_action = actions[0] if actions else {}
+    preferred_element_id = str(first_action.get("element_id") or "") or None
+    containers = _collection_container_records_from_elements(
+        elements,
+        preferred_element_id=preferred_element_id,
+        element_index=element_index,
+    )
+    preferred_collection_ax_path = None
+    preferred_summary = next(
+        (element for element in elements if isinstance(element, dict) and str(element.get("id") or "") == preferred_element_id),
+        None,
+    )
+    if isinstance(preferred_summary, dict):
+        preferred_collection_ax_path = preferred_summary.get("collection_container_ax_path")
+    preferred_ui = element_index.get(preferred_element_id) if preferred_element_id else None
+    if not preferred_collection_ax_path and isinstance(preferred_ui, legacy.UiElement):
+        preferred_role_base = legacy.base_role(preferred_ui.role)
+        if preferred_role_base in OPEN_COLLECTION_CONTAINER_ROLES and preferred_ui.ax_path:
+            preferred_collection_ax_path = preferred_ui.ax_path
+        elif (
+            preferred_role_base in OPEN_COLLECTION_TRIGGER_ROLES
+            and preferred_ui.x is not None
+            and preferred_ui.y is not None
+            and preferred_ui.width is not None
+            and preferred_ui.height is not None
+        ):
+            trigger_frame = (preferred_ui.x, preferred_ui.y, preferred_ui.width, preferred_ui.height)
+            container = _collection_membership_from_frame(trigger_frame, containers)
+            if container is None and containers:
+                container = min(containers, key=lambda item: _frame_distance(trigger_frame, item["frame"]))
+            if isinstance(container, dict):
+                preferred_collection_ax_path = container.get("ax_path")
+    if not containers and preferred_element_id:
+        preferred = element_index.get(preferred_element_id)
+        if preferred is not None and preferred.x is not None and preferred.y is not None and preferred.width is not None and preferred.height is not None:
+            containers = [
+                {
+                    "id": preferred_element_id,
+                    "source": preferred.source,
+                    "role": preferred.role,
+                    "direct_ax": preferred.ax_path is not None,
+                    "role_base": legacy.base_role(preferred.role),
+                    "text": preferred.text,
+                    "frame": (preferred.x, preferred.y, preferred.width, preferred.height),
+                    "ax_path": preferred.ax_path,
+                }
+            ]
+            preferred_collection_ax_path = preferred.ax_path
+    if not containers:
+        return [], []
+    candidates: list[dict[str, Any]] = []
+    for element in elements:
+        if not isinstance(element, dict):
+            continue
+        element_id = str(element.get("id") or "")
+        if any(element_id == str(container.get("id") or "") for container in containers):
+            continue
+        role_base = _element_base_role_from_summary(element)
+        if not _is_open_collection_option_role(role_base):
+            continue
+        if not legacy.clean_text(element.get("text"), limit=240):
+            continue
+        if preferred_collection_ax_path:
+            if element.get("collection_container_ax_path") != preferred_collection_ax_path:
+                continue
+        else:
+            frame = _frame_tuple_from_summary_element(element)
+            if frame is None or not _is_candidate_near_any_collection(frame, containers):
+                continue
+        candidates.append(element)
+    candidates.sort(key=lambda item: _collection_option_sort_key(item, containers))
+    return containers, candidates[:limit]
+
+
+def _preferred_option_selection_action(element: dict[str, Any]) -> dict[str, Any]:
+    secondary_actions = [str(action) for action in (element.get("secondary_actions") or [])]
+    for preferred in ("Select", "Press", "Confirm"):
+        if preferred in secondary_actions:
+            return {"type": "secondary_action", "element_id": str(element.get("id")), "action": preferred}
+    return {"type": "click", "element_id": str(element.get("id"))}
+
+
+def _compact_collection_records_for_prompt(collection_containers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    compacted: list[dict[str, Any]] = []
+    for container in collection_containers:
+        frame = container.get("frame")
+        frame_mapping = None
+        if isinstance(frame, tuple) and len(frame) == 4:
+            frame_mapping = {
+                "x": int(round(float(frame[0]))),
+                "y": int(round(float(frame[1]))),
+                "width": int(round(float(frame[2]))),
+                "height": int(round(float(frame[3]))),
+            }
+        compact = {
+            "id": container.get("id"),
+            "source": container.get("source", "ax"),
+            "role": container.get("role") or container.get("role_base"),
+            "text": container.get("text"),
+            "direct_ax": container.get("direct_ax", True),
+            "frame": frame_mapping,
+        }
+        compacted.append({key: value for key, value in compact.items() if value is not None})
+    return compacted
+
+
+def _planner_elements_by_id(elements: list[dict[str, Any]] | None) -> dict[str, dict[str, Any]]:
+    return {
+        str(element.get("id") or ""): element
+        for element in (elements or [])
+        if isinstance(element, dict) and element.get("id")
+    }
+
+
+def _raw_collection_items(
+    raw_ax_elements: list[dict[str, Any]],
+    *,
+    container_ax_path: str,
+    container_frame: tuple[float, float, float, float] | None,
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for item in raw_ax_elements:
+        if not isinstance(item, dict) or item.get("source") != "ax":
+            continue
+        ax_path = legacy.clean_text(item.get("axPath") or item.get("ax_path"), limit=1000)
+        order = _collection_child_order(ax_path, container_ax_path)
+        if order is None:
+            continue
+        frame = _frame_tuple_from_raw_ax_item(item)
+        items.append(
+            {
+                "index": str(item.get("index")) if item.get("index") is not None else None,
+                "role": str(item.get("role") or ""),
+                "text": legacy.clean_text(item.get("text"), limit=240),
+                "frame": frame,
+                "ax_path": ax_path,
+                "order": order,
+                "secondary_actions": _normalized_secondary_actions(item.get("secondaryActions") or item.get("secondary_actions")),
+                "visible_in_viewport": bool(
+                    frame is not None
+                    and container_frame is not None
+                    and _frame_contains_with_margin(container_frame, frame, margin_x=8.0, margin_y=8.0)
+                ),
+            }
+        )
+    items.sort(key=lambda item: item["order"])
+    return items
+
+
+def _collection_scroll_instruction(
+    *,
+    target_order: int,
+    visible_orders: list[int],
+) -> tuple[str, float] | None:
+    if not visible_orders:
+        return None
+    visible_orders = sorted(visible_orders)
+    min_visible = visible_orders[0]
+    max_visible = visible_orders[-1]
+    if min_visible <= target_order <= max_visible:
+        return None
+    visible_span = max(1, max_visible - min_visible + 1)
+    midpoint = (min_visible + max_visible) / 2.0
+    delta_rows = target_order - midpoint
+    direction = "down" if delta_rows > 0 else "up"
+    pages = max(PRECISE_SCROLL_PAGES, min(4.0, abs(delta_rows) / visible_span))
+    return direction, pages
+
+
+def _collection_visible_midpoint(visible_orders: Sequence[int]) -> float | None:
+    if not visible_orders:
+        return None
+    ordered = sorted(int(value) for value in visible_orders)
+    return (ordered[0] + ordered[-1]) / 2.0
+
+
+def _normalized_collection_value_text(text: str | None) -> str:
+    cleaned = legacy.clean_text(text or "", limit=240) or ""
+    return " ".join(cleaned.lower().split())
+
+
+def _collection_value_tokens(text: str | None) -> list[str]:
+    normalized = _normalized_collection_value_text(text)
+    if not normalized:
+        return []
+    seen: set[str] = set()
+    tokens: list[str] = []
+    for token in normalized.split(" "):
+        token = token.strip()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        tokens.append(token)
+    return tokens
+
+
+def _match_collection_value_to_item(
+    value_text: str | None,
+    collection_items: Sequence[dict[str, Any]],
+) -> dict[str, Any] | None:
+    normalized_value = _normalized_collection_value_text(value_text)
+    if not normalized_value:
+        return None
+    value_tokens = set(_collection_value_tokens(normalized_value))
+    best_item: dict[str, Any] | None = None
+    best_score: tuple[int, int, int, int, int] | None = None
+    for item in collection_items:
+        item_text = legacy.clean_text(item.get("text"), limit=240)
+        normalized_item = _normalized_collection_value_text(item_text)
+        if not normalized_item:
+            continue
+        item_tokens = _collection_value_tokens(normalized_item)
+        exact_token_matches = [token for token in item_tokens if token in value_tokens]
+        token_match_lengths = [len(token) for token in exact_token_matches]
+        best_token_match = max(token_match_lengths, default=0)
+        full_match = 1 if normalized_item == normalized_value else 0
+        if full_match == 0 and best_token_match == 0:
+            continue
+        score = (
+            full_match,
+            best_token_match,
+            len(exact_token_matches),
+            len(normalized_item),
+            1 if item.get("visible_in_viewport") else 0,
+            -abs(int(item.get("order") or 0)),
+        )
+        if best_score is None or score > best_score:
+            best_score = score
+            best_item = item
+    return best_item
+
+
+def _nearest_collection_value_source_from_raw_ax(
+    raw_ax_elements: Sequence[dict[str, Any]],
+    *,
+    anchor_frame: tuple[float, float, float, float] | None,
+    collection_items: Sequence[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    if anchor_frame is None:
+        return None
+    best_item: dict[str, Any] | None = None
+    best_score: tuple[int, float, float, float] | None = None
+    anchor_center_x, anchor_center_y = _frame_center(anchor_frame)
+    for item in raw_ax_elements:
+        if not isinstance(item, dict) or item.get("source") != "ax":
+            continue
+        role_base = _element_base_role_from_raw_ax(item)
+        if role_base not in OPEN_COLLECTION_VALUE_SOURCE_ROLES:
+            continue
+        frame = _frame_tuple_from_raw_ax_item(item)
+        text = legacy.clean_text(item.get("text"), limit=240)
+        if frame is None or not text:
+            continue
+        item_center_x, item_center_y = _frame_center(frame)
+        vertical_distance = abs(item_center_y - anchor_center_y)
+        horizontal_distance = abs(item_center_x - anchor_center_x)
+        semantic_match = (
+            1
+            if collection_items and _match_collection_value_to_item(text, collection_items) is not None
+            else 0
+        )
+        score = (
+            -semantic_match,
+            vertical_distance,
+            horizontal_distance,
+            0.0 if role_base in OPEN_COLLECTION_TRIGGER_ROLES else 1.0,
+        )
+        if best_score is None or score < best_score:
+            best_score = score
+            best_item = item
+    return best_item
+
+
+def _build_visible_option_selector_prompt(
+    *,
+    user_instruction: str,
+    target_identifier: str,
+    step_number: int,
+    current_plan: dict[str, Any],
+    recent_history: list[dict[str, Any]],
+    progress_summary: dict[str, Any],
+    collection_containers: list[dict[str, Any]],
+    option_candidates: list[dict[str, Any]],
+) -> str:
+    payload = {
+        "user_instruction": user_instruction,
+        "target_identifier": target_identifier,
+        "step_number": step_number,
+        "current_plan": current_plan,
+        "recent_history": recent_history,
+        "progress_summary": progress_summary,
+        "collection_containers": _compact_collection_records_for_prompt(collection_containers),
+        "option_candidates": _compact_elements_for_prompt(option_candidates),
+    }
+    return (
+        "You are a specialist dropdown/list/menu option selector for a desktop UI automation agent.\n"
+        "The main planner is about to navigate an open collection, usually by scrolling.\n"
+        "Your only job is to decide whether one of the provided collection option candidates already satisfies the user's goal.\n"
+        "Candidates may include both currently visible items and offscreen items from the same open collection.\n"
+        "If an exact or semantically correct candidate is present anywhere in option_candidates, select it now instead of continuing to scroll.\n"
+        "An offscreen candidate is still valid to select; the executor can align the collection to it.\n"
+        "Return null only when the intended value is not present among option_candidates or the choices are genuinely ambiguous.\n"
+        "Choose only from the provided option_candidates element ids. Never invent ids. Never return coordinates.\n"
+        "Return JSON only with this exact shape:\n"
+        "{\"element_id\":\"e12\"|null,\"reason\":\"...\"}\n\n"
+        "Current state JSON:\n"
+        f"{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+
+def build_stage_planner_prompt(
+    *,
+    user_instruction: str,
+    explicit_target: str | None,
+    candidate_apps: list[dict[str, Any]],
+) -> str:
+    payload = {
+        "user_instruction": user_instruction,
+        "explicit_target": explicit_target,
+        "candidate_apps": candidate_apps,
+        "current_date": datetime.now().strftime("%Y-%m-%d"),
+    }
+    return (
+        "You are a semantic task decomposition planner for a desktop computer-use agent.\n"
+        "Break the user's request into the smallest meaningful stages only when staging materially improves reliability.\n"
+        "Do not use app-specific assumptions. Reason from task semantics only.\n"
+        "Each stage controls exactly one target application.\n"
+        "Choose stage targets from explicit_target or candidate_apps only.\n"
+        "If the task contains structured form fields such as date, start time, end time, duration, recipient, or payload handoff, prefer focused stages for those fields instead of one large stage.\n"
+        "If a later stage needs text or a link produced by an earlier stage, needs_multi_stage must be true. Set expects_share_text=true on the producing stage and use {{shared_payload}} in the downstream stage instruction.\n"
+        "If the task includes both generating a shareable payload and sending or forwarding it elsewhere, you must produce at least two stages: produce/extract payload, then send payload.\n"
+        "If the task includes structured temporal constraints plus a form submission goal, you should usually split the primary work into focused stages such as open/configure date/configure time/configure duration/submit, unless the UI already visibly satisfies some of those fields.\n"
+        "If multi-stage decomposition is unnecessary, return needs_multi_stage=false.\n"
+        "Return JSON only with this exact shape:\n"
+        "{\"needs_multi_stage\":true|false,\"reason\":\"...\",\"stages\":[{\"name\":\"...\",\"target\":\"...\",\"instruction\":\"...\",\"max_steps\":8,\"expects_share_text\":false}]}\n\n"
+        "Current state JSON:\n"
+        f"{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+
+def build_stage_plan_refiner_prompt(
+    *,
+    user_instruction: str,
+    explicit_target: str | None,
+    candidate_apps: list[dict[str, Any]],
+    proposed_plan: dict[str, Any],
+) -> str:
+    payload = {
+        "user_instruction": user_instruction,
+        "explicit_target": explicit_target,
+        "candidate_apps": candidate_apps,
+        "proposed_plan": proposed_plan,
+    }
+    return (
+        "You are a semantic stage-plan reviewer for a desktop automation agent.\n"
+        "Review the proposed stage plan and rewrite it only if it is too coarse or violates the decomposition rules.\n"
+        "Keep the plan generic. Do not use app-specific assumptions.\n"
+        "A plan is too coarse when it mixes producing a payload and sending that payload in one stage, or when it keeps multiple structured field-setting goals inside one stage even though splitting them would clearly improve reliability.\n"
+        "If the plan is already appropriately granular, return it unchanged.\n"
+        "Return JSON only with the same shape as the planner output.\n\n"
+        "Current state JSON:\n"
+        f"{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+
+def _candidate_apps_for_stage_planner(client: MCPClient | Any, instruction: str, explicit_target: str | None) -> list[dict[str, Any]]:
+    candidates = discover_apps_via_mcp(client)
+    ranked: list[tuple[int, int, legacy.AppCandidate]] = []
+    for candidate in candidates:
+        score, alias_length, _ = legacy.app_match_score(instruction, candidate)
+        if explicit_target and explicit_target in candidate.aliases:
+            score += 2000
+        ranked.append((score, alias_length, candidate))
+    ranked.sort(key=lambda item: (item[0], item[1], item[2].path is not None), reverse=True)
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for score, _, candidate in ranked[:20]:
+        if candidate.identifier in seen:
+            continue
+        seen.add(candidate.identifier)
+        result.append(
+            {
+                "display_name": candidate.display_name,
+                "identifier": candidate.identifier,
+                "bundle_id": candidate.bundle_id,
+                "path": candidate.path,
+                "aliases": list(candidate.aliases[:6]),
+                "match_score": score,
+            }
+        )
+    return result
+
+
+def _normalize_stage_planner_payload(payload: dict[str, Any], explicit_target: str | None) -> list[WorkflowStage] | None:
+    if not bool(payload.get("needs_multi_stage")):
+        return None
+    stages_raw = payload.get("stages")
+    if not isinstance(stages_raw, list) or len(stages_raw) < 2:
+        return None
+    stages: list[WorkflowStage] = []
+    for index, raw_stage in enumerate(stages_raw, start=1):
+        if not isinstance(raw_stage, dict):
+            continue
+        instruction = legacy.clean_text(raw_stage.get("instruction"), limit=2000)
+        if not instruction:
+            continue
+        target = legacy.clean_text(raw_stage.get("target"), limit=200) or (explicit_target if index == 1 else None)
+        name = legacy.safe_path_component(legacy.clean_text(raw_stage.get("name"), limit=120) or f"stage-{index}")
+        expects_share_text = bool(raw_stage.get("expects_share_text"))
+        try:
+            max_steps = int(raw_stage.get("max_steps", 12))
+        except (TypeError, ValueError):
+            max_steps = 12
+        max_steps = min(20, max(4, max_steps))
+        stages.append(
+            WorkflowStage(
+                name=name,
+                target=target,
+                instruction=instruction,
+                expects_share_text=expects_share_text,
+                metadata={"max_steps": max_steps},
+            )
+        )
+    if len(stages) < 2:
+        return None
+    return stages
+
+
+def invoke_stage_planner_with_trace(
+    *,
+    prompt: str,
+    artifact_dir: Path | None,
+    model_name: str | None,
+    kind: str = "task_stage_planner",
+) -> str:
+    root = artifact_dir or legacy.session_artifact_dir(cwd=Path.cwd())
+    call_root = root / "llm-calls"
+    call_root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    call_dir = call_root / f"000-{legacy.safe_path_component(kind)}-step-00-{stamp}"
+    call_dir.mkdir(parents=True, exist_ok=True)
+    metadata = {
+        "kind": kind,
+        "step_number": 0,
+        "model": model_name or DEFAULT_LLM_MODEL,
+        "prompt_characters": len(prompt),
+        "prompt_breakdown": _build_prompt_breakdown(prompt, model_name=model_name or DEFAULT_LLM_MODEL),
+        "status": "pending",
+        "call_dir": os.fspath(call_dir),
+    }
+    (call_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
+    legacy.write_json(call_dir / "request_content.json", {"prompt": prompt})
+    legacy.write_json(call_dir / "metadata.json", metadata)
+    try:
+        response_text, llm_metadata = invoke_chat_model(prompt, model_name=model_name)
+    except Exception as exc:
+        metadata["status"] = "error"
+        metadata["error"] = repr(exc)
+        legacy.write_json(call_dir / "metadata.json", metadata)
+        raise
+    metadata["status"] = "completed"
+    metadata["usage"] = _normalize_usage_metadata(llm_metadata)
+    metadata["timing"] = {
+        "started_at": llm_metadata.get("started_at"),
+        "finished_at": llm_metadata.get("finished_at"),
+        "elapsed_ms": llm_metadata.get("elapsed_ms"),
+    }
+    (call_dir / "response.txt").write_text(response_text, encoding="utf-8")
+    legacy.write_json(call_dir / "metadata.json", metadata)
+    return response_text
+
+
+def plan_task_stages(args: argparse.Namespace, client: MCPClient | Any, *, artifact_dir: Path | None = None) -> list[WorkflowStage] | None:
+    candidate_apps = _candidate_apps_for_stage_planner(client, args.instruction, args.target)
+    matched_count = sum(1 for app in candidate_apps if int(app.get("match_score") or 0) > 0)
+    if matched_count < 2:
+        return None
+    prompt = build_stage_planner_prompt(
+        user_instruction=args.instruction,
+        explicit_target=args.target,
+        candidate_apps=candidate_apps,
+    )
+    try:
+        raw = invoke_stage_planner_with_trace(
+            prompt=prompt,
+            artifact_dir=artifact_dir,
+            model_name=args.model,
+            kind="task_stage_planner",
+        )
+    except Exception as exc:
+        print(f"warning: task stage planning failed; falling back to single-stage workflow: {exc}", file=sys.stderr)
+        return None
+    try:
+        payload = legacy.parse_llm_json_object(raw)
+    except Exception as exc:
+        print(f"warning: task stage planner returned invalid JSON; falling back to single-stage workflow: {exc}", file=sys.stderr)
+        return None
+    normalized = _normalize_stage_planner_payload(payload, args.target)
+    if normalized is None:
+        return None
+    refiner_prompt = build_stage_plan_refiner_prompt(
+        user_instruction=args.instruction,
+        explicit_target=args.target,
+        candidate_apps=candidate_apps,
+        proposed_plan=payload,
+    )
+    try:
+        refined_raw = invoke_stage_planner_with_trace(
+            prompt=refiner_prompt,
+            artifact_dir=artifact_dir,
+            model_name=args.model,
+            kind="task_stage_refiner",
+        )
+        refined_payload = legacy.parse_llm_json_object(refined_raw)
+        refined = _normalize_stage_planner_payload(refined_payload, args.target)
+        return refined or normalized
+    except Exception as exc:
+        print(f"warning: task stage refiner failed; using initial stage plan: {exc}", file=sys.stderr)
+        return normalized
+
+
+def _stage_output_path(base_path: Path | None, stage_index: int, stage_name: str) -> Path | None:
+    if base_path is None:
+        return None
+    suffix = "".join(base_path.suffixes)
+    stem = base_path.name[: -len(suffix)] if suffix else base_path.name
+    return base_path.with_name(f"{stem}.stage-{stage_index:02d}-{legacy.safe_path_component(stage_name)}{suffix}")
+
+
 def _normalize_keypress(key: str) -> str:
     aliases = {
         "enter": "Return",
@@ -431,6 +1454,12 @@ def _compact_elements_for_prompt(elements: list[dict[str, Any]]) -> list[dict[st
             compact["ocr_confidence"] = element.get("ocr_confidence")
         if "name" in element and element.get("name") is not None:
             compact["name"] = element.get("name")
+        if "secondary_actions" in element and element.get("secondary_actions"):
+            compact["secondary_actions"] = element.get("secondary_actions")
+        if "collection_visible_in_viewport" in element and element.get("collection_visible_in_viewport") is not None:
+            compact["collection_visible_in_viewport"] = bool(element.get("collection_visible_in_viewport"))
+        if "collection_order" in element and element.get("collection_order") is not None:
+            compact["collection_order"] = element.get("collection_order")
         frame = _compact_frame(element.get("frame"))
         if frame is not None:
             compact["frame"] = frame
@@ -485,6 +1514,7 @@ def _compact_result_for_prompt(result: dict[str, Any]) -> dict[str, Any]:
         "mode": result.get("mode"),
         "action_type": action.get("type"),
         "element_id": action.get("element_id"),
+        "secondary_action": action.get("action"),
         "text_length": action.get("text_length"),
         "point": result.get("point"),
         "input_method": result.get("input_method"),
@@ -492,6 +1522,7 @@ def _compact_result_for_prompt(result: dict[str, Any]) -> dict[str, Any]:
         "fallback_from": result.get("fallback_from"),
         "fallback_reason": result.get("fallback_reason"),
         "fallback_skipped": result.get("fallback_skipped"),
+        "supported_secondary_actions": result.get("supported_secondary_actions"),
         "error": result.get("error"),
     }
     diagnostics = result.get("input_diagnostics")
@@ -517,19 +1548,26 @@ def _compact_result_for_prompt(result: dict[str, Any]) -> dict[str, Any]:
 def _compact_history_for_prompt(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
     compacted: list[dict[str, Any]] = []
     for item in history[-3:]:
-        compacted.append(
-            {
-                "step": item.get("step"),
-                "status": item.get("status"),
-                "summary": item.get("summary"),
-                "actions": item.get("actions"),
-                "execution_results": [
-                    _compact_result_for_prompt(result)
-                    for result in (item.get("execution_results") or [])
-                    if isinstance(result, dict)
-                ],
+        compact_item = {
+            "step": item.get("step"),
+            "status": item.get("status"),
+            "summary": item.get("summary"),
+            "actions": item.get("actions"),
+            "execution_results": [
+                _compact_result_for_prompt(result)
+                for result in (item.get("execution_results") or [])
+                if isinstance(result, dict)
+            ],
+        }
+        completion_verification = item.get("completion_verification")
+        if isinstance(completion_verification, dict):
+            compact_item["completion_verification"] = {
+                "status": completion_verification.get("status"),
+                "confidence": completion_verification.get("confidence"),
+                "summary": completion_verification.get("summary"),
+                "evidence": completion_verification.get("evidence"),
             }
-        )
+        compacted.append(compact_item)
     return compacted
 
 
@@ -554,6 +1592,9 @@ def _build_progress_summary_from_steps(step_records: list[dict[str, Any]], app_p
     coordinate_click_attempts = 0
     direct_ax_failures = 0
     last_non_wait_action: dict[str, Any] | None = None
+    target_counts: dict[str, int] = {}
+    point_counts: dict[tuple[int, int], int] = {}
+    verifier_summaries: list[str] = []
 
     for step in step_records:
         plan = step.get("plan") or {}
@@ -568,6 +1609,9 @@ def _build_progress_summary_from_steps(step_records: list[dict[str, Any]], app_p
                 typed_texts.append(str(action.get("text")))
             elif action_type == "click" and action.get("x") is not None and action.get("y") is not None:
                 coordinate_click_attempts += 1
+                point_key = _action_coordinate_key(action)
+                if point_key is not None:
+                    point_counts[point_key] = point_counts.get(point_key, 0) + 1
             if action_type and action_type not in {"wait", "finish"}:
                 last_non_wait_action = action
 
@@ -577,17 +1621,23 @@ def _build_progress_summary_from_steps(step_records: list[dict[str, Any]], app_p
             text = legacy.clean_text(element.get("text"), limit=120)
             if text:
                 clicked_targets.append(text)
+                target_counts[text] = target_counts.get(text, 0) + 1
 
         for result in step.get("execution_results") or []:
             if not isinstance(result, dict):
                 continue
-            if result.get("mode") == "direct_ax" and not result.get("ok"):
+            if (result.get("mode") == "direct_ax" and not result.get("ok")) or result.get("fallback_from") == "direct_ax":
                 direct_ax_failures += 1
             action = result.get("action")
             if isinstance(action, dict):
                 action_type = str(action.get("type") or "").lower()
                 if action_type and action_type not in {"wait", "finish"}:
                     last_non_wait_action = action
+        completion_verification = step.get("completion_verification")
+        if isinstance(completion_verification, dict):
+            summary = legacy.clean_text(completion_verification.get("summary"), limit=240)
+            if summary:
+                verifier_summaries.append(summary)
 
     org_like_targets = [
         text
@@ -608,7 +1658,9 @@ def _build_progress_summary_from_steps(step_records: list[dict[str, Any]], app_p
         "coordinate_click_attempts": coordinate_click_attempts,
         "direct_ax_failures": direct_ax_failures,
         "last_non_wait_action": last_non_wait_action,
+        "recent_verifier_summaries": _unique_preserve_order(verifier_summaries, limit=4),
     }
+    repeated_points = [f"({x},{y})" for (x, y), count in point_counts.items() if count >= 2]
     if org_like_targets:
         summary["org_targets_attempted"] = _unique_preserve_order(org_like_targets, limit=5)
     if contact_like_targets:
@@ -617,6 +1669,15 @@ def _build_progress_summary_from_steps(step_records: list[dict[str, Any]], app_p
     repeat_guard: list[str] = [
         "Treat completed later-stage milestones as durable. Do not restart from the beginning unless the current UI directly contradicts them.",
     ]
+    repeated_targets = [text for text, count in sorted(target_counts.items(), key=lambda item: item[1], reverse=True) if count >= 2]
+    if repeated_targets:
+        repeat_guard.append(
+            "If the same visible target has already been clicked multiple times without verifier-confirmed progress, change strategy instead of repeating that click."
+        )
+    if repeated_points:
+        repeat_guard.append(
+            "If the same raw coordinate has already been tried multiple times without progress, do not click that coordinate again. Choose a different anchor or action type."
+        )
     if typed_texts:
         repeat_guard.append(
             "A search/contact query was already entered. Do not go back to prerequisite navigation unless the current UI clearly lost the query or target path."
@@ -631,6 +1692,10 @@ def _build_progress_summary_from_steps(step_records: list[dict[str, Any]], app_p
                 "If opening the searched contact failed once, prefer the next fallback path such as 通讯录 or a different visible result. Do not bounce back to organization switching."
             )
     summary["repeat_guard"] = repeat_guard
+    if repeated_targets:
+        summary["repeated_targets"] = _unique_preserve_order(repeated_targets, limit=6)
+    if repeated_points:
+        summary["repeated_points"] = _unique_preserve_order(repeated_points, limit=6)
     return summary
 
 
@@ -643,6 +1708,207 @@ def _inject_progress_summary_into_prompt(prompt: str, progress_summary: dict[str
     if marker in prompt:
         return prompt.replace(marker, progress_block + marker, 1)
     return prompt + "\n\n" + progress_block
+
+
+def _inject_extended_action_guidance(prompt: str) -> str:
+    action_schema = (
+        "Extended MCP action schema:\n"
+        "- {\"type\":\"secondary_action\",\"element_id\":\"e12\",\"action\":\"Press|Raise|ShowMenu|Confirm|Cancel|Increment|Decrement|Focus|Select|Deselect|ScrollUp|ScrollDown|ScrollLeft|ScrollRight\"}\n"
+        "- {\"type\":\"drag\",\"from_element_id\":\"e12\",\"to_element_id\":\"e13\"}\n"
+        "- {\"type\":\"drag\",\"from_x\":123,\"from_y\":456,\"to_x\":789,\"to_y\":456}\n\n"
+        "Extended action rules:\n"
+        "- Prefer the MCP-native actions above. Do not use mousemove; the current MCP controller exposes click, secondary_action, drag, scroll, type_text, and press_key.\n"
+        "- If an element exposes secondary_actions and the needed action is listed there, prefer secondary_action over repeated coordinate clicks.\n"
+        "- If recent_history shows a click failed because Press is unsupported and supported_secondary_actions are available, your next action should usually be a matching secondary_action on that same element.\n"
+        "- Prefer interactive controls such as Button, MenuButton, Incrementor, CheckBox, RadioButton, or TextField over adjacent StaticText labels. Do not click a StaticText label when a nearby real control exposes the actual interaction.\n"
+        "- Use secondary_action=Increment/Decrement for picker steppers or incrementors instead of clicking them repeatedly.\n"
+        "- Use secondary_action=ShowMenu for menu buttons or pop-up buttons when a direct Press is unreliable.\n"
+        "- When a dropdown, pop-up list, or menu is open and the desired option is already visible in the current AX/OCR candidates, directly choose that visible option instead of scrolling.\n"
+        "- Only scroll an open list or menu after confirming the needed option is not currently visible among the collection candidates.\n"
+        "- Use drag only when moving a slider, scrubbing a picker, selecting a range, or drag-and-drop is visibly required.\n\n"
+    )
+    marker = "Element notes:\n"
+    if marker in prompt:
+        return prompt.replace(marker, action_schema + marker, 1)
+    return prompt + "\n\n" + action_schema
+
+
+def _action_coordinate_key(action: dict[str, Any]) -> tuple[int, int] | None:
+    try:
+        if action.get("x") is None or action.get("y") is None:
+            return None
+        return int(round(float(action["x"]))), int(round(float(action["y"])))
+    except (TypeError, ValueError):
+        return None
+
+
+def _stagnation_constraints_from_steps(step_records: list[dict[str, Any]]) -> dict[str, Any]:
+    disallowed_points: list[tuple[int, int]] = []
+    disallowed_element_ids: list[str] = []
+    point_counts: dict[tuple[int, int], int] = {}
+    element_counts: dict[str, int] = {}
+    for step in step_records[-4:]:
+        verifier = step.get("completion_verification") or {}
+        if str(verifier.get("status") or "") == "satisfied":
+            continue
+        actions = (step.get("plan") or {}).get("actions") or []
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            point_key = _action_coordinate_key(action)
+            if point_key is not None:
+                point_counts[point_key] = point_counts.get(point_key, 0) + 1
+            element_id = action.get("element_id")
+            if element_id:
+                element_counts[str(element_id)] = element_counts.get(str(element_id), 0) + 1
+    disallowed_points = [point for point, count in point_counts.items() if count >= 2]
+    disallowed_element_ids = [element_id for element_id, count in element_counts.items() if count >= 2]
+    return {
+        "disallowed_points": [{"x": point[0], "y": point[1]} for point in disallowed_points],
+        "disallowed_element_ids": disallowed_element_ids,
+    }
+
+
+def _inject_stagnation_constraints(prompt: str, constraints: dict[str, Any]) -> str:
+    if not constraints.get("disallowed_points") and not constraints.get("disallowed_element_ids"):
+        return prompt
+    block = (
+        "Stagnation recovery constraints JSON:\n"
+        f"{json.dumps(constraints, ensure_ascii=False)}\n"
+        "Do not return any coordinate or element_id listed above unless the current UI now clearly shows new evidence that the previously failed target has changed state.\n"
+        "If those actions failed repeatedly, choose a materially different control, action type, or navigation path.\n\n"
+    )
+    marker = "Current state JSON:\n"
+    if marker in prompt:
+        return prompt.replace(marker, block + marker, 1)
+    return prompt + "\n\n" + block
+
+
+def _plan_conflicts_with_stagnation_constraints(plan: dict[str, Any], constraints: dict[str, Any]) -> bool:
+    disallowed_points = {
+        (int(item["x"]), int(item["y"]))
+        for item in constraints.get("disallowed_points") or []
+        if isinstance(item, dict) and item.get("x") is not None and item.get("y") is not None
+    }
+    disallowed_element_ids = {str(item) for item in constraints.get("disallowed_element_ids") or []}
+    for action in plan.get("actions") or []:
+        if not isinstance(action, dict):
+            continue
+        point_key = _action_coordinate_key(action)
+        if point_key is not None and point_key in disallowed_points:
+            return True
+        element_id = action.get("element_id")
+        if element_id is not None and str(element_id) in disallowed_element_ids:
+            return True
+    return False
+
+
+def _element_identity_key(element: dict[str, Any]) -> tuple[Any, ...]:
+    frame = _compact_frame(element.get("frame"))
+    frame_key = tuple(frame.values()) if frame is not None else None
+    return (
+        element.get("source"),
+        element.get("role"),
+        legacy.clean_text(element.get("text"), limit=200),
+        frame_key,
+    )
+
+
+def _dedupe_elements_for_prompt(elements: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for element in elements:
+        if not isinstance(element, dict):
+            continue
+        key = _element_identity_key(element)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(element)
+    return deduped
+
+
+def validate_plan(plan: dict[str, Any], element_index: dict[str, legacy.UiElement], *, max_actions_per_step: int) -> list[dict[str, Any]]:
+    actions = plan.get("actions")
+    if not isinstance(actions, list):
+        raise ValueError("plan.actions must be a list")
+    if len(actions) > max_actions_per_step:
+        plan["dropped_actions"] = actions[max_actions_per_step:]
+        plan["actions"] = actions[:max_actions_per_step]
+        actions = plan["actions"]
+        print(
+            f"warning: planner returned more than {max_actions_per_step} action(s); only the first action(s) will execute before re-observation",
+            file=sys.stderr,
+        )
+
+    normalized: list[dict[str, Any]] = []
+    for raw_action in actions:
+        if not isinstance(raw_action, dict):
+            raise ValueError(f"action must be an object: {raw_action!r}")
+        action = dict(raw_action)
+        action_type = str(action.get("type", "")).lower()
+        if action_type not in EXTENDED_ACTION_TYPES:
+            raise ValueError(f"unsupported action type: {action_type!r}")
+        action["type"] = action_type
+        if action_type == "secondary_action":
+            element_id = str(action.get("element_id") or "")
+            secondary_action = _normalize_secondary_action_name(action.get("action"))
+            if not element_id or element_id not in element_index:
+                raise ValueError(f"secondary_action needs a known element_id: {raw_action!r}")
+            if secondary_action not in MCP_SECONDARY_ACTIONS:
+                raise ValueError(f"unsupported secondary action: {secondary_action!r}")
+            action["action"] = secondary_action
+        elif action_type == "drag":
+            from_element_id = action.get("from_element_id")
+            to_element_id = action.get("to_element_id")
+            if from_element_id and str(from_element_id) not in element_index:
+                raise ValueError(f"unknown drag from_element_id: {from_element_id!r}")
+            if to_element_id and str(to_element_id) not in element_index:
+                raise ValueError(f"unknown drag to_element_id: {to_element_id!r}")
+            has_element_refs = bool(from_element_id and to_element_id)
+            has_coordinates = all(key in action for key in ("from_x", "from_y", "to_x", "to_y"))
+            if not has_element_refs and not has_coordinates:
+                raise ValueError(f"drag action needs from/to element ids or coordinates: {raw_action!r}")
+        elif "element_id" in action and action["element_id"] not in element_index:
+            raise ValueError(f"unknown element_id: {action['element_id']!r}")
+        normalized.append(action)
+    return normalized
+
+
+def _drag_point(action: dict[str, Any], element_index: dict[str, legacy.UiElement], prefix: str) -> tuple[float, float]:
+    element_key = action.get(f"{prefix}_element_id")
+    if element_key:
+        return element_index[str(element_key)].center
+    return float(action[f"{prefix}_x"]), float(action[f"{prefix}_y"])
+
+
+def _should_use_clipboard_paste(text: str) -> bool:
+    return bool(text and ("\n" in text or "http://" in text or "https://" in text or len(text) >= 80))
+
+
+def _write_clipboard(text: str) -> None:
+    proc = subprocess.run(["pbcopy"], input=text, text=True, capture_output=True, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "pbcopy failed")
+
+
+def _parse_supported_secondary_actions(text: str) -> list[str]:
+    match = re.search(r"Supported actions:\s*(.+)$", text, re.IGNORECASE)
+    if match is None:
+        return []
+    values = re.split(r"\s*,\s*", match.group(1).strip())
+    normalized = [_normalize_secondary_action_name(value) for value in values]
+    return [value for value in normalized if value in MCP_SECONDARY_ACTIONS]
+
+
+def _secondary_action_scroll_direction(action: str) -> str | None:
+    mapping = {
+        "ScrollUp": "up",
+        "ScrollDown": "down",
+        "ScrollLeft": "left",
+        "ScrollRight": "right",
+    }
+    return mapping.get(action)
 
 
 def _element_role_is_text_input(role: Any) -> bool:
@@ -896,6 +2162,52 @@ def list_apps(args: argparse.Namespace) -> int:
     return 0
 
 
+def _share_text_candidate(text: str) -> bool:
+    normalized = text.strip()
+    if not normalized:
+        return False
+    markers = ("http://", "https://", "会议号", "会议链接", "入会密码", "加入会议", "复制邀请", "邀请信息")
+    return any(marker in normalized for marker in markers)
+
+
+def extract_share_text_heuristic(elements: list[dict[str, Any]]) -> str | None:
+    candidates: list[str] = []
+    for element in elements:
+        if not isinstance(element, dict):
+            continue
+        text = str(element.get("text") or "").strip()
+        if not _share_text_candidate(text):
+            continue
+        candidates.append(text)
+    if not candidates:
+        return None
+    candidates.sort(key=len, reverse=True)
+    return candidates[0]
+
+
+def build_share_text_extractor_prompt(
+    *,
+    stage_instruction: str,
+    observation: dict[str, Any],
+    elements: list[dict[str, Any]],
+) -> str:
+    payload = {
+        "stage_instruction": stage_instruction,
+        "observation": observation,
+        "elements": elements,
+    }
+    return (
+        "You extract a shareable downstream payload from the current UI.\n"
+        "Return JSON only. Do not use markdown.\n"
+        "If the current UI visibly contains a meeting invitation, link, meeting number, or invite text that should be forwarded, return it exactly.\n"
+        "Preserve URLs, line breaks, and meeting numbers. Do not invent missing text.\n"
+        "Return exactly this JSON shape:\n"
+        "{\"status\":\"found|missing\",\"share_text\":\"...\",\"summary\":\"...\"}\n\n"
+        "Current state JSON:\n"
+        f"{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+
 class LangGraphComputerUseWorkflow:
     def __init__(self, args: argparse.Namespace, *, mcp_client: MCPClient | Any | None = None):
         self.args = args
@@ -953,9 +2265,15 @@ class LangGraphComputerUseWorkflow:
         traversal = self.traversal_from_app_state(initial_app_state)
         pid = int(initial_app_state["pid"])
         app_profile = legacy.resolve_app_profile(target_identifier, target_resolution, traversal)
+        requested_visual_planning = _requested_visual_planning_for_profile(self.args.visual_planning, app_profile)
+        if requested_visual_planning != self.args.visual_planning:
+            print(
+                "warning: requested visual planning was overridden to auto because this fixed-strategy AX-poor profile needs screenshot assistance",
+                file=sys.stderr,
+            )
         workflow_mode, visual_planning = legacy.apply_capability_decision(
             requested_mode=self.args.mode,
-            requested_visual_planning=self.args.visual_planning,
+            requested_visual_planning=requested_visual_planning,
             profile=app_profile,
             decision=None,
         )
@@ -974,7 +2292,7 @@ class LangGraphComputerUseWorkflow:
             "app_profile": app_profile.name,
             "app_guide_path": app_profile.guide_path,
             "app_guide_warnings": list(legacy.app_guide_warnings()),
-            "requested_visual_planning": self.args.visual_planning,
+            "requested_visual_planning": requested_visual_planning,
             "visual_planning": visual_planning,
             "capability_selection": capability_decision,
             "artifact_root": os.fspath(self.args.plan_output.parent if self.args.plan_output else legacy.session_artifact_dir(cwd=Path.cwd(), create=False)),
@@ -998,6 +2316,7 @@ class LangGraphComputerUseWorkflow:
                 "app_profile": app_profile,
                 "workflow_mode": workflow_mode,
                 "visual_planning": visual_planning,
+                "requested_visual_planning": requested_visual_planning,
                 "capability_decision": capability_decision,
                 "artifact_dir": artifact_dir,
                 "run_log": run_log,
@@ -1102,7 +2421,7 @@ class LangGraphComputerUseWorkflow:
         capability_decision = self.resolve_capability_decision(state, traversal, app_profile)
         workflow_mode, visual_planning = legacy.apply_capability_decision(
             requested_mode=self.args.mode,
-            requested_visual_planning=self.args.visual_planning,
+            requested_visual_planning=state.get("requested_visual_planning", self.args.visual_planning),
             profile=app_profile,
             decision=capability_decision,
         )
@@ -1214,7 +2533,7 @@ class LangGraphComputerUseWorkflow:
             }
         else:
             plan = self.make_plan(state)
-        actions = legacy.validate_plan(plan, state["element_index"], max_actions_per_step=self.args.max_actions_per_step)
+        actions = validate_plan(plan, state["element_index"], max_actions_per_step=self.args.max_actions_per_step)
         plan["actions"] = actions
         step_record: dict[str, Any] = {
             "step": state["step_number"],
@@ -1258,6 +2577,7 @@ class LangGraphComputerUseWorkflow:
             target_identifier=state["target_identifier"],
             target_pid=state["pid"],
             app_profile=state["app_profile"],
+            planner_elements=state["elements"],
         )
         state["step_record"]["execution_results"] = execution_results
         state["history"].append(
@@ -1335,7 +2655,7 @@ class LangGraphComputerUseWorkflow:
         if not should_select_with_llm:
             profile_mode, profile_visual = legacy.apply_capability_decision(
                 requested_mode=self.args.mode,
-                requested_visual_planning=self.args.visual_planning,
+                requested_visual_planning=state.get("requested_visual_planning", self.args.visual_planning),
                 profile=app_profile,
                 decision=None,
             )
@@ -1432,6 +2752,7 @@ class LangGraphComputerUseWorkflow:
             state.get("run_log", {}).get("steps", []),
             state["app_profile"].name,
         )
+        stagnation_constraints = _stagnation_constraints_from_steps(state.get("run_log", {}).get("steps", []))
         prompt = legacy.build_planner_prompt(
             self.args.instruction,
             state["target_identifier"],
@@ -1446,6 +2767,8 @@ class LangGraphComputerUseWorkflow:
             app_profile=state["app_profile"],
         )
         prompt = _inject_progress_summary_into_prompt(prompt, progress_summary)
+        prompt = _inject_extended_action_guidance(prompt)
+        prompt = _inject_stagnation_constraints(prompt, stagnation_constraints)
         try:
             raw, _ = self.invoke_llm_with_trace(
                 prompt=prompt,
@@ -1462,10 +2785,38 @@ class LangGraphComputerUseWorkflow:
                     "planner_element_count": len(planner_elements),
                     "planner_history_length": len(planner_history),
                     "progress_summary": progress_summary,
+                    "stagnation_constraints": stagnation_constraints,
                 },
                 run_log=state.get("run_log"),
             )
-            return legacy.parse_llm_plan(raw)
+            plan = legacy.parse_llm_plan(raw)
+            if _plan_conflicts_with_stagnation_constraints(plan, stagnation_constraints):
+                repair_prompt = (
+                    prompt
+                    + "\n\nThe previous proposal reused a disallowed coordinate or element that already failed repeatedly."
+                    + " Return one materially different next action."
+                )
+                repair_raw, _ = self.invoke_llm_with_trace(
+                    prompt=repair_prompt,
+                    artifact_dir=state["artifact_dir"],
+                    kind="planner_repair",
+                    step_number=state["step_number"],
+                    model_name=self.args.model,
+                    image_base64=state["planner_images"] or None,
+                    extra={
+                        "workflow_mode": state["workflow_mode"],
+                        "app_profile": state["app_profile"].name,
+                        "stagnation_constraints": stagnation_constraints,
+                    },
+                    run_log=state.get("run_log"),
+                )
+                plan = legacy.parse_llm_plan(repair_raw)
+            plan = self.maybe_rewrite_plan_for_visible_option_selection(
+                state,
+                plan,
+                progress_summary=progress_summary,
+            )
+            return plan
         except Exception as exc:
             allow_fallback = not self.args.no_fallback and (not self.args.execute or self.args.mock_plan)
             if not allow_fallback:
@@ -1516,6 +2867,102 @@ class LangGraphComputerUseWorkflow:
             run_log=state.get("run_log"),
         )
         return _normalize_completion_verdict(legacy.parse_llm_json_object(raw))
+
+    def maybe_rewrite_plan_for_visible_option_selection(
+        self,
+        state: dict[str, Any],
+        plan: dict[str, Any],
+        *,
+        progress_summary: dict[str, Any],
+    ) -> dict[str, Any]:
+        actions = plan.get("actions") or []
+        if len(actions) != 1:
+            return plan
+        first_action = actions[0]
+        if not isinstance(first_action, dict) or not _is_collection_navigation_action(first_action, state["element_index"]):
+            return plan
+        collection_containers, option_candidates = _visible_option_candidates_for_plan(
+            state["elements"],
+            state["element_index"],
+            plan,
+        )
+        if not option_candidates:
+            return plan
+        prompt = _build_visible_option_selector_prompt(
+            user_instruction=self.args.instruction,
+            target_identifier=state["target_identifier"],
+            step_number=state["step_number"],
+            current_plan=plan,
+            recent_history=_compact_history_for_prompt(state["history"]),
+            progress_summary=progress_summary,
+            collection_containers=collection_containers,
+            option_candidates=option_candidates,
+        )
+        try:
+            raw, _ = self.invoke_llm_with_trace(
+                prompt=prompt,
+                artifact_dir=state["artifact_dir"],
+                kind="visible_option_selector",
+                step_number=state["step_number"],
+                model_name=self.args.model,
+                extra={
+                    "current_plan": plan,
+                    "collection_container_count": len(collection_containers),
+                    "option_candidate_count": len(option_candidates),
+                },
+                run_log=state.get("run_log"),
+            )
+            payload = legacy.parse_llm_json_object(raw)
+        except Exception as exc:
+            print(f"warning: visible option selector failed; keeping original plan: {exc}", file=sys.stderr)
+            return plan
+        selected_element_id = str(payload.get("element_id") or "").strip()
+        if not selected_element_id:
+            return plan
+        candidate = next(
+            (item for item in option_candidates if str(item.get("id") or "") == selected_element_id),
+            None,
+        )
+        if candidate is None:
+            return plan
+        rewritten_plan = copy.deepcopy(plan)
+        rewritten_plan["actions"] = [_preferred_option_selection_action(candidate)]
+        reason = legacy.clean_text(payload.get("reason"), limit=400)
+        if reason:
+            rewritten_plan["summary"] = reason
+            rewritten_plan["visible_option_selector_reason"] = reason
+        rewritten_plan["visible_option_selector_original_action"] = first_action
+        rewritten_plan["visible_option_selector_chosen_element"] = selected_element_id
+        return rewritten_plan
+
+    def extract_share_text(self, state: dict[str, Any]) -> str | None:
+        heuristic = extract_share_text_heuristic(state.get("elements") or [])
+        if heuristic:
+            return heuristic
+        elements = _elements_for_completion_verifier(state.get("elements") or [], limit=120)
+        observation = _compact_observation_for_prompt(state.get("observation") or {}, elements)
+        prompt = build_share_text_extractor_prompt(
+            stage_instruction=self.args.instruction,
+            observation=observation,
+            elements=elements,
+        )
+        raw, _ = self.invoke_llm_with_trace(
+            prompt=prompt,
+            artifact_dir=state["artifact_dir"],
+            kind="share_text_extractor",
+            step_number=state.get("step_number", 0),
+            model_name=self.args.model,
+            extra={
+                "app_profile": state["app_profile"].name,
+                "element_count": len(elements),
+            },
+            run_log=state.get("run_log"),
+        )
+        payload = legacy.parse_llm_json_object(raw)
+        if str(payload.get("status") or "").lower() != "found":
+            return None
+        share_text = str(payload.get("share_text") or "").strip()
+        return share_text or None
 
     def maybe_apply_direct_ax_noop_fallback(
         self,
@@ -1652,6 +3099,36 @@ class LangGraphComputerUseWorkflow:
             include_menus=include_menus,
             include_virtual_hints=include_virtual_hints,
         )
+        raw_ax_elements = [
+            item
+            for item in (app_state.get("elements") or [])
+            if isinstance(item, dict) and item.get("source") == "ax"
+        ]
+        ax_elements = _augment_ax_elements_with_collection_candidates(
+            ax_elements,
+            element_index,
+            raw_ax_elements,
+        )
+        by_path_secondary_actions: dict[str, list[str]] = {}
+        for item in raw_ax_elements:
+            if not isinstance(item, dict) or item.get("source") != "ax":
+                continue
+            ax_path = legacy.clean_text(item.get("axPath") or item.get("ax_path"), limit=1000)
+            if not ax_path:
+                continue
+            secondary_actions = item.get("secondaryActions") or item.get("secondary_actions") or []
+            if isinstance(secondary_actions, list):
+                by_path_secondary_actions[ax_path] = [
+                    normalized
+                    for action in secondary_actions
+                    if (normalized := _normalize_secondary_action_name(action))
+                ]
+        for element in ax_elements:
+            ui_element = element_index.get(str(element.get("id") or ""))
+            if ui_element is not None and ui_element.ax_path is not None:
+                secondary_actions = by_path_secondary_actions.get(ui_element.ax_path)
+                if secondary_actions:
+                    element["secondary_actions"] = secondary_actions
         planner_ax_index = self.map_planner_ax_indices(ax_elements, element_index, app_state.get("elements") or [])
         combined_elements = list(ax_elements)
         screenshot_payload = app_state.get("screenshot") or {}
@@ -1681,6 +3158,7 @@ class LangGraphComputerUseWorkflow:
                 element_index,
             )
             combined_elements.extend(profile_region_elements)
+        combined_elements = _dedupe_elements_for_prompt(combined_elements)
         planner_images: list[str] = []
         visual_observation: dict[str, Any] = {
             "enabled": visual_planning_enabled,
@@ -1762,6 +3240,543 @@ class LangGraphComputerUseWorkflow:
                 mapping[element_id] = mcp_index
         return mapping
 
+    def _scroll_arguments_for_collection_container(
+        self,
+        *,
+        target_identifier: str,
+        current_container_mcp_index: str | None,
+        container_element_id: str | None,
+        container_frame: tuple[float, float, float, float] | None,
+        planner_ax_index: dict[str, str],
+        direction: str,
+        pages: float,
+    ) -> dict[str, Any]:
+        arguments: dict[str, Any] = {
+            "app": target_identifier,
+            "direction": direction,
+            "pages": pages,
+        }
+        if current_container_mcp_index:
+            arguments["element_index"] = current_container_mcp_index
+            return arguments
+        if container_element_id and container_element_id in planner_ax_index:
+            arguments["element_index"] = planner_ax_index[container_element_id]
+            return arguments
+        if container_frame is not None:
+            cx, cy = _frame_center(container_frame)
+            arguments["x"] = cx
+            arguments["y"] = cy
+        return arguments
+
+    def _drag_arguments_for_collection_container(
+        self,
+        *,
+        target_identifier: str,
+        container_frame: tuple[float, float, float, float],
+        delta_y: float,
+    ) -> dict[str, Any]:
+        x, y, width, height = container_frame
+        cx = float(x) + (float(width) / 2.0)
+        margin = min(24.0, max(12.0, float(height) * 0.18))
+        min_y = float(y) + margin
+        max_y = float(y) + float(height) - margin
+        if max_y <= min_y:
+            min_y = float(y)
+            max_y = float(y) + float(height)
+        cy = (min_y + max_y) / 2.0
+        max_shift = max(18.0, min(max_y - min_y - 2.0, COLLECTION_DRAG_MAX_POINTS, float(height) * COLLECTION_DRAG_MAX_RATIO))
+        shift = min(max(abs(float(delta_y)), COLLECTION_DRAG_MIN_POINTS), max_shift)
+        if float(delta_y) >= 0.0:
+            from_y = max(min_y, cy - (shift / 2.0))
+            to_y = min(max_y, cy + (shift / 2.0))
+        else:
+            from_y = min(max_y, cy + (shift / 2.0))
+            to_y = max(min_y, cy - (shift / 2.0))
+        return {
+            "app": target_identifier,
+            "from_x": cx,
+            "from_y": from_y,
+            "to_x": cx,
+            "to_y": to_y,
+        }
+
+    def _drag_arguments_for_collection_item(
+        self,
+        *,
+        target_identifier: str,
+        container_frame: tuple[float, float, float, float],
+        item_frame: tuple[float, float, float, float],
+        delta_y: float,
+    ) -> dict[str, Any]:
+        x, y, width, height = container_frame
+        item_center_x, item_center_y = _frame_center(item_frame)
+        cx = min(max(item_center_x, float(x) + 8.0), float(x) + float(width) - 8.0)
+        margin = min(24.0, max(12.0, float(height) * 0.12))
+        min_y = float(y) + margin
+        max_y = float(y) + float(height) - margin
+        if max_y <= min_y:
+            min_y = float(y)
+            max_y = float(y) + float(height)
+        from_y = min(max(item_center_y, min_y), max_y)
+        max_shift = max(18.0, min(max_y - min_y - 2.0, COLLECTION_DRAG_MAX_POINTS, float(height) * COLLECTION_DRAG_MAX_RATIO))
+        requested_shift = max(-max_shift, min(max_shift, float(delta_y)))
+        overshoot = max(COLLECTION_DRAG_MIN_POINTS, float(height) * COLLECTION_DRAG_OVERSHOOT_RATIO)
+        min_drag_y = float(y) - overshoot
+        max_drag_y = float(y) + float(height) + overshoot
+        to_y = min(max(from_y + requested_shift, min_drag_y), max_drag_y)
+        actual_shift = to_y - from_y
+        if 0.0 < abs(actual_shift) < COLLECTION_DRAG_MIN_POINTS:
+            if requested_shift >= 0.0:
+                to_y = min(max_drag_y, from_y + COLLECTION_DRAG_MIN_POINTS)
+            else:
+                to_y = max(min_drag_y, from_y - COLLECTION_DRAG_MIN_POINTS)
+        return {
+            "app": target_identifier,
+            "from_x": cx,
+            "from_y": from_y,
+            "to_x": cx,
+            "to_y": to_y,
+        }
+
+    def _maybe_execute_collection_option_selection(
+        self,
+        *,
+        action: dict[str, Any],
+        element: legacy.UiElement | None,
+        planner_elements_by_id: dict[str, dict[str, Any]],
+        planner_ax_index: dict[str, str],
+        target_identifier: str,
+        target_pid: int,
+    ) -> dict[str, Any] | None:
+        if element is None:
+            return None
+        summary = planner_elements_by_id.get(element.element_id)
+        if not isinstance(summary, dict):
+            return None
+        container_ax_path = summary.get("collection_container_ax_path")
+        target_order = summary.get("collection_order")
+        if not isinstance(container_ax_path, str) or target_order is None:
+            return None
+        if summary.get("collection_visible_in_viewport"):
+            return None
+        container_element_id = summary.get("collection_container_element_id")
+        container_summary = (
+            planner_elements_by_id.get(str(container_element_id))
+            if container_element_id is not None
+            else None
+        )
+        desired_container_frame = (
+            _frame_tuple_from_summary_element(container_summary)
+            if isinstance(container_summary, dict)
+            else None
+        )
+        target_ax_path = element.ax_path
+        target_text = legacy.clean_text(summary.get("text"), limit=240) or element.text
+        desired_secondary_action = _normalize_secondary_action_name(action.get("action")) if action.get("type") == "secondary_action" else None
+
+        scroll_attempts = 0
+        drag_attempts = 0
+        reopen_attempts = 0
+        last_scroll_args: dict[str, Any] | None = None
+        last_drag_args: dict[str, Any] | None = None
+        last_visible_signature: tuple[int, ...] | None = None
+        last_visible_midpoint: float | None = None
+        last_drag_delta_y: float | None = None
+        last_alignment_method: str | None = None
+        selected_order_per_point: float | None = None
+        last_selected_order: int | None = None
+        last_selected_distance_to_target: int | None = None
+        drag_order_per_point: float | None = None
+        drag_target_y_per_point: float | None = None
+        last_target_center_y: float | None = None
+        last_target_distance_to_center: float | None = None
+        cached_collection_items: list[dict[str, Any]] = []
+        cached_container_frame: tuple[float, float, float, float] | None = None
+        cached_value_source_frame: tuple[float, float, float, float] | None = None
+        prefer_drag_alignment = False
+        probe_sign = 1.0
+        for _ in range(COLLECTION_ALIGNMENT_MAX_ATTEMPTS):
+            app_state = self.fetch_app_state(target_identifier)
+            raw_ax_elements = [
+                item
+                for item in (app_state.get("elements") or [])
+                if isinstance(item, dict) and item.get("source") == "ax"
+            ]
+            raw_collection_containers = _collection_container_records_from_raw_ax(raw_ax_elements)
+            resolved_container = next(
+                (
+                    container
+                    for container in raw_collection_containers
+                    if legacy.clean_text(container.get("ax_path"), limit=1000) == container_ax_path
+                ),
+                None,
+            )
+            if resolved_container is None and desired_container_frame is not None and raw_collection_containers:
+                resolved_container = min(
+                    raw_collection_containers,
+                    key=lambda container: _frame_distance(desired_container_frame, container["frame"]),
+                )
+            resolved_container_ax_path = (
+                legacy.clean_text(resolved_container.get("ax_path"), limit=1000)
+                if isinstance(resolved_container, dict)
+                else None
+            )
+            container_item = next(
+                (
+                    item
+                    for item in raw_ax_elements
+                    if resolved_container_ax_path
+                    and legacy.clean_text(item.get("axPath") or item.get("ax_path"), limit=1000) == resolved_container_ax_path
+                ),
+                None,
+            )
+            container_frame = (
+                tuple(resolved_container["frame"])
+                if isinstance(resolved_container, dict) and resolved_container.get("frame") is not None
+                else _frame_tuple_from_raw_ax_item(container_item) if isinstance(container_item, dict) else None
+            )
+            current_container_mcp_index = str(container_item.get("index")) if isinstance(container_item, dict) and container_item.get("index") is not None else None
+            if container_frame is not None:
+                cached_container_frame = container_frame
+            collection_items = _raw_collection_items(
+                raw_ax_elements,
+                container_ax_path=resolved_container_ax_path or container_ax_path,
+                container_frame=container_frame,
+            )
+            if collection_items:
+                cached_collection_items = list(collection_items)
+            selection_items = collection_items or cached_collection_items
+            anchor_frame = container_frame or cached_container_frame or cached_value_source_frame
+            value_source_item = _nearest_collection_value_source_from_raw_ax(
+                raw_ax_elements,
+                anchor_frame=anchor_frame,
+                collection_items=selection_items,
+            )
+            if isinstance(value_source_item, dict):
+                value_source_frame = _frame_tuple_from_raw_ax_item(value_source_item)
+                if value_source_frame is not None:
+                    cached_value_source_frame = value_source_frame
+            current_value_text = legacy.clean_text(value_source_item.get("text"), limit=240) if isinstance(value_source_item, dict) else None
+            current_selected_item = _match_collection_value_to_item(current_value_text, selection_items)
+            current_selected_order = (
+                int(current_selected_item["order"])
+                if isinstance(current_selected_item, dict) and current_selected_item.get("order") is not None
+                else None
+            )
+            current_selected_distance_to_target = (
+                abs(int(target_order) - current_selected_order)
+                if current_selected_order is not None
+                else None
+            )
+            current_selected_visible_item = _match_collection_value_to_item(current_value_text, collection_items)
+            target_item = next(
+                (
+                    item
+                    for item in selection_items
+                    if (target_ax_path and item.get("ax_path") == target_ax_path)
+                    or (item.get("order") == target_order and legacy.clean_text(item.get("text"), limit=240) == target_text)
+                ),
+                None,
+            )
+            if target_item is None:
+                if not collection_items and isinstance(value_source_item, dict):
+                    value_source_index = value_source_item.get("index")
+                    if value_source_index is not None:
+                        reopen_attempts += 1
+                        reopen_result = self.mcp.call_tool(
+                            "perform_secondary_action",
+                            {"app": target_identifier, "element_index": str(value_source_index), "action": "ShowMenu"},
+                        )
+                        reopen_text = _content_text(reopen_result)
+                        if _mcp_call_succeeded(reopen_result, reopen_text):
+                            time.sleep(0.2)
+                            continue
+                break
+            if current_selected_order == int(target_order):
+                return {
+                    "action": action,
+                    "ok": True,
+                    "activated_pid": target_pid,
+                    "activation": "mcp_session",
+                    "mode": "collection_option_value_selected",
+                    "collection_target_text": target_text,
+                    "collection_target_order": target_order,
+                    "collection_current_value_text": current_value_text,
+                    "collection_scroll_attempts": scroll_attempts,
+                    "collection_drag_attempts": drag_attempts,
+                    "collection_reopen_attempts": reopen_attempts,
+                }
+            current_target_center_y = None
+            if collection_items and target_item.get("frame") is not None:
+                _, current_target_center_y = _frame_center(target_item["frame"])
+            current_target_distance_to_center = None
+            target_far_offscreen = False
+            if current_target_center_y is not None and container_frame is not None:
+                _, container_center_y = _frame_center(container_frame)
+                current_target_distance_to_center = abs(current_target_center_y - container_center_y)
+                target_far_offscreen = (
+                    not bool(target_item.get("visible_in_viewport"))
+                    and current_target_distance_to_center > (float(container_frame[3]) * 0.75)
+                )
+            if collection_items and target_item.get("visible_in_viewport") and target_item.get("frame") is not None:
+                mcp_index = target_item.get("index")
+                if desired_secondary_action and desired_secondary_action in {"Select", "Press", "Confirm"} and mcp_index:
+                    result = self.mcp.call_tool(
+                        "perform_secondary_action",
+                        {"app": target_identifier, "element_index": mcp_index, "action": desired_secondary_action},
+                    )
+                    text = _content_text(result)
+                    if _mcp_call_succeeded(result, text):
+                        return {
+                            "action": action,
+                            "ok": True,
+                            "activated_pid": target_pid,
+                            "activation": "mcp_session",
+                            "mode": "collection_option_secondary_action",
+                            "ax_path": target_item.get("ax_path"),
+                            "collection_target_text": target_text,
+                            "collection_target_order": target_order,
+                            "collection_current_value_text": current_value_text,
+                            "collection_scroll_attempts": scroll_attempts,
+                            "collection_drag_attempts": drag_attempts,
+                            "collection_reopen_attempts": reopen_attempts,
+                            "tool_output": text[-1000:],
+                        }
+                tx, ty = _frame_center(target_item["frame"])
+                result = self.mcp.call_tool("click", {"app": target_identifier, "x": tx, "y": ty})
+                text = _content_text(result)
+                return {
+                    "action": action,
+                    "ok": _mcp_call_succeeded(result, text),
+                    "activated_pid": target_pid,
+                    "activation": "mcp_session",
+                    "mode": "collection_option_coordinate",
+                    "ax_path": target_item.get("ax_path"),
+                    "point": {"x": tx, "y": ty},
+                    "collection_target_text": target_text,
+                    "collection_target_order": target_order,
+                    "collection_current_value_text": current_value_text,
+                    "collection_scroll_attempts": scroll_attempts,
+                    "collection_drag_attempts": drag_attempts,
+                    "collection_reopen_attempts": reopen_attempts,
+                    "tool_output": text[-1000:],
+                }
+            if not collection_items:
+                if isinstance(value_source_item, dict):
+                    value_source_index = value_source_item.get("index")
+                    if value_source_index is not None:
+                        reopen_attempts += 1
+                        reopen_result = self.mcp.call_tool(
+                            "perform_secondary_action",
+                            {"app": target_identifier, "element_index": str(value_source_index), "action": "ShowMenu"},
+                        )
+                        reopen_text = _content_text(reopen_result)
+                        if _mcp_call_succeeded(reopen_result, reopen_text):
+                            time.sleep(0.2)
+                            continue
+                break
+            visible_orders = [int(item["order"]) for item in collection_items if item.get("visible_in_viewport") and item.get("order") is not None]
+            visible_signature = tuple(sorted(visible_orders))
+            visible_midpoint = _collection_visible_midpoint(visible_orders)
+            if current_selected_visible_item is not None and current_selected_visible_item.get("frame") is not None and current_selected_order is not None:
+                prefer_drag_alignment = True
+            if last_alignment_method == "scroll" and last_visible_signature is not None and visible_signature == last_visible_signature:
+                prefer_drag_alignment = True
+            if (
+                last_alignment_method == "drag"
+                and last_visible_midpoint is not None
+                and visible_midpoint is not None
+                and last_drag_delta_y not in {None, 0.0}
+            ):
+                observed_order_delta = visible_midpoint - last_visible_midpoint
+                if abs(observed_order_delta) >= 0.5:
+                    drag_order_per_point = observed_order_delta / float(last_drag_delta_y)
+                else:
+                    probe_sign *= -1.0
+            if (
+                last_alignment_method == "drag"
+                and last_selected_order is not None
+                and current_selected_order is not None
+                and last_drag_delta_y not in {None, 0.0}
+            ):
+                observed_selected_delta = current_selected_order - last_selected_order
+                if abs(observed_selected_delta) >= 1:
+                    selected_order_per_point = observed_selected_delta / float(last_drag_delta_y)
+                else:
+                    probe_sign *= -1.0
+                    selected_order_per_point = None
+            if (
+                last_alignment_method == "drag"
+                and last_target_center_y is not None
+                and current_target_center_y is not None
+                and last_drag_delta_y not in {None, 0.0}
+            ):
+                observed_target_y_delta = current_target_center_y - last_target_center_y
+                if abs(observed_target_y_delta) >= 1.0:
+                    drag_target_y_per_point = observed_target_y_delta / float(last_drag_delta_y)
+            if (
+                last_alignment_method == "drag"
+                and last_target_distance_to_center is not None
+                and current_target_distance_to_center is not None
+                and current_target_distance_to_center > last_target_distance_to_center + 8.0
+            ):
+                probe_sign *= -1.0
+                drag_order_per_point = None
+                drag_target_y_per_point = None
+            if (
+                last_alignment_method == "drag"
+                and last_selected_distance_to_target is not None
+                and current_selected_distance_to_target is not None
+                and current_selected_distance_to_target > last_selected_distance_to_target
+            ):
+                probe_sign *= -1.0
+                selected_order_per_point = None
+            instruction = _collection_scroll_instruction(target_order=int(target_order), visible_orders=visible_orders)
+            if instruction is None:
+                break
+            if not prefer_drag_alignment:
+                direction, pages = instruction
+                last_scroll_args = self._scroll_arguments_for_collection_container(
+                    target_identifier=target_identifier,
+                    current_container_mcp_index=current_container_mcp_index,
+                    container_element_id=str(container_element_id) if container_element_id else None,
+                    container_frame=container_frame,
+                    planner_ax_index=planner_ax_index,
+                    direction=direction,
+                    pages=pages,
+                )
+                scroll_result = self.mcp.call_tool("scroll", last_scroll_args)
+                scroll_text = _content_text(scroll_result)
+                scroll_attempts += 1
+                last_alignment_method = "scroll"
+                last_visible_signature = visible_signature
+                last_visible_midpoint = visible_midpoint
+                last_drag_delta_y = None
+                if not _mcp_call_succeeded(scroll_result, scroll_text):
+                    prefer_drag_alignment = True
+                    if container_frame is None:
+                        return {
+                            "action": action,
+                            "ok": False,
+                            "activated_pid": target_pid,
+                            "activation": "mcp_session",
+                            "mode": "collection_option_scroll_failed",
+                            "collection_target_text": target_text,
+                            "collection_target_order": target_order,
+                            "collection_scroll_attempts": scroll_attempts,
+                            "scroll_arguments": last_scroll_args,
+                            "error": scroll_text[-1000:],
+                        }
+                else:
+                    time.sleep(0.2)
+                    continue
+            if container_frame is None or visible_midpoint is None:
+                break
+            if (
+                selected_order_per_point is not None
+                and abs(selected_order_per_point) >= 0.01
+                and current_selected_order is not None
+                and not target_far_offscreen
+            ):
+                drag_delta_y = (float(target_order) - float(current_selected_order)) / float(selected_order_per_point)
+                max_drag = max(COLLECTION_DRAG_MIN_POINTS, min(COLLECTION_DRAG_MAX_POINTS, float(container_frame[3]) * COLLECTION_DRAG_MAX_RATIO))
+                drag_delta_y = max(-max_drag, min(max_drag, drag_delta_y))
+                if 0.0 < abs(drag_delta_y) < COLLECTION_DRAG_MIN_POINTS:
+                    drag_delta_y = COLLECTION_DRAG_MIN_POINTS if drag_delta_y > 0.0 else -COLLECTION_DRAG_MIN_POINTS
+            elif (
+                drag_target_y_per_point is not None
+                and abs(drag_target_y_per_point) >= 0.01
+                and current_target_center_y is not None
+            ):
+                _, container_center_y = _frame_center(container_frame)
+                drag_delta_y = (container_center_y - current_target_center_y) / float(drag_target_y_per_point)
+                max_drag = max(COLLECTION_DRAG_MIN_POINTS, min(COLLECTION_DRAG_MAX_POINTS, float(container_frame[3]) * COLLECTION_DRAG_MAX_RATIO))
+                drag_delta_y = max(-max_drag, min(max_drag, drag_delta_y))
+                if 0.0 < abs(drag_delta_y) < COLLECTION_DRAG_MIN_POINTS:
+                    drag_delta_y = COLLECTION_DRAG_MIN_POINTS if drag_delta_y > 0.0 else -COLLECTION_DRAG_MIN_POINTS
+            elif target_far_offscreen and current_target_center_y is not None:
+                _, container_center_y = _frame_center(container_frame)
+                desired_direction = 1.0 if current_target_center_y > container_center_y else -1.0
+                drag_delta_y = desired_direction * min(
+                    COLLECTION_DRAG_MAX_POINTS,
+                    max(COLLECTION_DRAG_MIN_POINTS, abs(current_target_center_y - container_center_y) * 0.25),
+                )
+            elif current_selected_order is not None:
+                drag_delta_y = max(COLLECTION_DRAG_MIN_POINTS, min(COLLECTION_DRAG_MAX_POINTS, float(container_frame[3]) * COLLECTION_VALUE_PROBE_RATIO))
+                drag_delta_y *= probe_sign if int(target_order) >= int(current_selected_order) else -probe_sign
+            elif current_target_center_y is not None:
+                _, container_center_y = _frame_center(container_frame)
+                drag_delta_y = container_center_y - current_target_center_y
+                max_drag = max(COLLECTION_DRAG_MIN_POINTS, min(COLLECTION_DRAG_MAX_POINTS, float(container_frame[3]) * COLLECTION_DRAG_MAX_RATIO))
+                drag_delta_y = max(-max_drag, min(max_drag, drag_delta_y))
+                if 0.0 < abs(drag_delta_y) < COLLECTION_DRAG_MIN_POINTS:
+                    drag_delta_y = COLLECTION_DRAG_MIN_POINTS if drag_delta_y > 0.0 else -COLLECTION_DRAG_MIN_POINTS
+            elif drag_order_per_point is None or abs(drag_order_per_point) < 0.01:
+                drag_delta_y = max(COLLECTION_DRAG_MIN_POINTS, min(COLLECTION_DRAG_MAX_POINTS, float(container_frame[3]) * COLLECTION_DRAG_PROBE_RATIO)) * probe_sign
+            else:
+                drag_delta_y = (float(target_order) - float(visible_midpoint)) / float(drag_order_per_point)
+                max_drag = max(COLLECTION_DRAG_MIN_POINTS, min(COLLECTION_DRAG_MAX_POINTS, float(container_frame[3]) * COLLECTION_DRAG_MAX_RATIO))
+                drag_delta_y = max(-max_drag, min(max_drag, drag_delta_y))
+                if 0.0 < abs(drag_delta_y) < COLLECTION_DRAG_MIN_POINTS:
+                    drag_delta_y = COLLECTION_DRAG_MIN_POINTS if drag_delta_y > 0.0 else -COLLECTION_DRAG_MIN_POINTS
+            if current_selected_visible_item is not None and current_selected_visible_item.get("frame") is not None and current_selected_order is not None:
+                last_drag_args = self._drag_arguments_for_collection_item(
+                    target_identifier=target_identifier,
+                    container_frame=container_frame,
+                    item_frame=current_selected_visible_item["frame"],
+                    delta_y=drag_delta_y,
+                )
+            else:
+                last_drag_args = self._drag_arguments_for_collection_container(
+                    target_identifier=target_identifier,
+                    container_frame=container_frame,
+                    delta_y=drag_delta_y,
+                )
+            drag_result = self.mcp.call_tool("drag", last_drag_args)
+            drag_text = _content_text(drag_result)
+            drag_attempts += 1
+            last_alignment_method = "drag"
+            last_visible_signature = visible_signature
+            last_visible_midpoint = visible_midpoint
+            last_drag_delta_y = drag_delta_y
+            last_selected_order = current_selected_order
+            last_selected_distance_to_target = current_selected_distance_to_target
+            last_target_center_y = current_target_center_y
+            last_target_distance_to_center = current_target_distance_to_center
+            if not _mcp_call_succeeded(drag_result, drag_text):
+                return {
+                    "action": action,
+                    "ok": False,
+                    "activated_pid": target_pid,
+                    "activation": "mcp_session",
+                    "mode": "collection_option_drag_failed",
+                    "collection_target_text": target_text,
+                    "collection_target_order": target_order,
+                    "collection_current_value_text": current_value_text,
+                    "collection_scroll_attempts": scroll_attempts,
+                    "collection_drag_attempts": drag_attempts,
+                    "collection_reopen_attempts": reopen_attempts,
+                    "drag_arguments": last_drag_args,
+                    "error": drag_text[-1000:],
+                }
+            time.sleep(0.2)
+        return {
+            "action": action,
+            "ok": False,
+            "activated_pid": target_pid,
+            "activation": "mcp_session",
+            "mode": "collection_option_unresolved",
+            "collection_target_text": target_text,
+            "collection_target_order": target_order,
+            "collection_current_value_text": current_value_text,
+            "collection_scroll_attempts": scroll_attempts,
+            "collection_drag_attempts": drag_attempts,
+            "collection_reopen_attempts": reopen_attempts,
+            "scroll_arguments": last_scroll_args,
+            "drag_arguments": last_drag_args,
+            "error": "collection target could not be brought into view for direct selection",
+        }
+
     def execute_plan_via_mcp(
         self,
         actions: list[dict[str, Any]],
@@ -1771,8 +3786,10 @@ class LangGraphComputerUseWorkflow:
         target_identifier: str,
         target_pid: int,
         app_profile: legacy.AppProfile | None = None,
+        planner_elements: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
+        planner_elements_by_id = _planner_elements_by_id(planner_elements)
         for i, action in enumerate(actions, start=1):
             action_type = action["type"]
             print(f"executing action {i}: {json.dumps(action, ensure_ascii=False)}", file=sys.stderr)
@@ -1787,6 +3804,20 @@ class LangGraphComputerUseWorkflow:
 
             if action_type in {"click", "doubleclick", "rightclick"}:
                 element = legacy.action_element(action, element_index)
+                if action_type == "click":
+                    collection_result = self._maybe_execute_collection_option_selection(
+                        action=action,
+                        element=element,
+                        planner_elements_by_id=planner_elements_by_id,
+                        planner_ax_index=planner_ax_index,
+                        target_identifier=target_identifier,
+                        target_pid=target_pid,
+                    )
+                    if collection_result is not None:
+                        collection_result["index"] = i
+                        results.append(collection_result)
+                        time.sleep(0.2)
+                        continue
                 point = legacy.action_point(action, element_index)
                 direct_ax_failure: str | None = None
                 if action_type == "click" and element is not None and element.ax_path is not None:
@@ -1814,6 +3845,7 @@ class LangGraphComputerUseWorkflow:
                             time.sleep(0.2)
                             continue
                         direct_ax_failure = text[-1000:] or "perform_secondary_action returned an unsuccessful result"
+                        supported_secondary_actions = _parse_supported_secondary_actions(direct_ax_failure)
                         if legacy.is_feishu_lark_context(target_identifier, app_profile):
                             results.append(
                                 {
@@ -1826,6 +3858,25 @@ class LangGraphComputerUseWorkflow:
                                     "mode": "direct_ax",
                                     "ax_path": element.ax_path,
                                     "fallback_skipped": "coordinate_fallback_disabled_for_feishu_lark",
+                                    "supported_secondary_actions": supported_secondary_actions,
+                                    "error": direct_ax_failure,
+                                }
+                            )
+                            time.sleep(0.2)
+                            continue
+                        if supported_secondary_actions and "Press" not in supported_secondary_actions:
+                            results.append(
+                                {
+                                    "index": i,
+                                    "action": action,
+                                    "ok": False,
+                                    "activated_pid": target_pid,
+                                    "activation": "mcp_session",
+                                    "target_pid": target_pid,
+                                    "mode": "direct_ax",
+                                    "ax_path": element.ax_path,
+                                    "fallback_skipped": "secondary_action_available",
+                                    "supported_secondary_actions": supported_secondary_actions,
                                     "error": direct_ax_failure,
                                 }
                             )
@@ -1860,6 +3911,106 @@ class LangGraphComputerUseWorkflow:
                 time.sleep(0.2)
                 continue
 
+            if action_type == "secondary_action":
+                element = legacy.action_element(action, element_index)
+                if element is None:
+                    raise ValueError(f"secondary_action needs element_id: {action!r}")
+                collection_result = self._maybe_execute_collection_option_selection(
+                    action=action,
+                    element=element,
+                    planner_elements_by_id=planner_elements_by_id,
+                    planner_ax_index=planner_ax_index,
+                    target_identifier=target_identifier,
+                    target_pid=target_pid,
+                )
+                if collection_result is not None:
+                    collection_result["index"] = i
+                    results.append(collection_result)
+                    time.sleep(0.2)
+                    continue
+                mcp_element_index = planner_ax_index.get(element.element_id)
+                if mcp_element_index is None:
+                    raise ValueError(f"secondary_action target is missing MCP element index: {action!r}")
+                secondary_action = str(action.get("action") or "")
+                scroll_direction = _secondary_action_scroll_direction(secondary_action)
+                if scroll_direction is not None:
+                    summary = planner_elements_by_id.get(element.element_id, {})
+                    scroll_element_id = str(summary.get("collection_container_element_id") or element.element_id)
+                    scroll_mcp_element_index = planner_ax_index.get(scroll_element_id, mcp_element_index)
+                    result = self.mcp.call_tool(
+                        "scroll",
+                        {
+                            "app": target_identifier,
+                            "element_index": scroll_mcp_element_index,
+                            "direction": scroll_direction,
+                            "pages": PRECISE_SCROLL_PAGES,
+                        },
+                    )
+                    text = _content_text(result)
+                    results.append(
+                        {
+                            "index": i,
+                            "action": action,
+                            "ok": _mcp_call_succeeded(result, text),
+                            "activated_pid": target_pid,
+                            "activation": "mcp_session",
+                            "mode": "secondary_action_scroll",
+                            "ax_path": element.ax_path,
+                            "pages": PRECISE_SCROLL_PAGES,
+                            "tool_output": text[-1000:],
+                        }
+                    )
+                else:
+                    result = self.mcp.call_tool(
+                        "perform_secondary_action",
+                        {"app": target_identifier, "element_index": mcp_element_index, "action": secondary_action},
+                    )
+                    text = _content_text(result)
+                    results.append(
+                        {
+                            "index": i,
+                            "action": action,
+                            "ok": _mcp_call_succeeded(result, text),
+                            "activated_pid": target_pid,
+                            "activation": "mcp_session",
+                            "mode": "secondary_action",
+                            "ax_path": element.ax_path,
+                            "tool_output": text[-1000:],
+                        }
+                    )
+                time.sleep(0.2)
+                continue
+
+            if action_type == "drag":
+                from_point = _drag_point(action, element_index, "from")
+                to_point = _drag_point(action, element_index, "to")
+                result = self.mcp.call_tool(
+                    "drag",
+                    {
+                        "app": target_identifier,
+                        "from_x": from_point[0],
+                        "from_y": from_point[1],
+                        "to_x": to_point[0],
+                        "to_y": to_point[1],
+                    },
+                )
+                text = _content_text(result)
+                results.append(
+                    {
+                        "index": i,
+                        "action": action,
+                        "ok": _mcp_call_succeeded(result, text),
+                        "activated_pid": target_pid,
+                        "activation": "mcp_session",
+                        "mode": "drag",
+                        "from_point": {"x": from_point[0], "y": from_point[1]},
+                        "to_point": {"x": to_point[0], "y": to_point[1]},
+                        "tool_output": text[-1000:],
+                    }
+                )
+                time.sleep(0.2)
+                continue
+
             if action_type == "mousemove":
                 point = legacy.action_point(action, element_index)
                 results.append(
@@ -1885,7 +4036,11 @@ class LangGraphComputerUseWorkflow:
                     "direction": direction,
                     "pages": pages,
                 }
-                mcp_element_index = planner_ax_index.get(element.element_id) if element is not None else None
+                mcp_element_index = None
+                if element is not None:
+                    summary = planner_elements_by_id.get(element.element_id, {})
+                    scroll_element_id = str(summary.get("collection_container_element_id") or element.element_id)
+                    mcp_element_index = planner_ax_index.get(scroll_element_id)
                 if mcp_element_index is not None:
                     arguments["element_index"] = mcp_element_index
                 else:
@@ -1997,8 +4152,18 @@ class LangGraphComputerUseWorkflow:
                             )
                             time.sleep(0.2)
                             continue
-                result = self.mcp.call_tool("type_text", {"app": target_identifier, "text": text})
-                tool_text = _content_text(result)
+                use_clipboard_paste = _should_use_clipboard_paste(text)
+                if use_clipboard_paste:
+                    _write_clipboard(text)
+                    result = self.mcp.call_tool("press_key", {"app": target_identifier, "key": "cmd+v"})
+                    tool_text = _content_text(result)
+                    mode = "clipboard_paste"
+                    input_method = "pbcopy_cmd_v"
+                else:
+                    result = self.mcp.call_tool("type_text", {"app": target_identifier, "text": text})
+                    tool_text = _content_text(result)
+                    mode = "keyboard"
+                    input_method = "mcp_type_text"
                 results.append(
                     {
                         "index": i,
@@ -2010,8 +4175,8 @@ class LangGraphComputerUseWorkflow:
                         "ok": _mcp_call_succeeded(result, tool_text),
                         "activated_pid": target_pid,
                         "activation": "mcp_session",
-                        "mode": "keyboard",
-                        "input_method": "mcp_type_text",
+                        "mode": mode,
+                        "input_method": input_method,
                         "input_diagnostics": input_diagnostics,
                         "tool_output": tool_text[-1000:],
                     }
@@ -2043,6 +4208,26 @@ class LangGraphComputerUseWorkflow:
 
 
 def build_summary(run_log: dict[str, Any]) -> dict[str, Any]:
+    if isinstance(run_log.get("stages"), list):
+        return {
+            "final_status": run_log.get("final_status"),
+            "instruction": run_log.get("instruction"),
+            "workflow_type": "multi_stage",
+            "stage_count": len(run_log.get("stages", [])),
+            "artifact_dir": run_log.get("artifact_dir"),
+            "plan_output": run_log.get("plan_output"),
+            "stages": [
+                {
+                    "name": stage.get("name"),
+                    "target": stage.get("target"),
+                    "instruction": stage.get("instruction"),
+                    "final_status": stage.get("final_status"),
+                    "plan_output": stage.get("plan_output"),
+                    "llm_call_dir": stage.get("llm_call_dir"),
+                }
+                for stage in run_log.get("stages", [])
+            ],
+        }
     return {
         "final_status": run_log.get("final_status"),
         "workflow_mode": run_log.get("workflow_mode"),
@@ -2060,17 +4245,123 @@ def build_summary(run_log: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def run_workflow(args: argparse.Namespace, *, mcp_client: MCPClient | Any | None = None) -> dict[str, Any]:
+def run_single_workflow_state(
+    args: argparse.Namespace,
+    *,
+    mcp_client: MCPClient | Any | None = None,
+) -> tuple[dict[str, Any], LangGraphComputerUseWorkflow]:
     runner = LangGraphComputerUseWorkflow(args, mcp_client=mcp_client)
+    recursion_limit = max(50, runner.max_steps * 4 + 12)
     try:
-        recursion_limit = max(50, runner.max_steps * 4 + 12)
         final_state = runner.build_graph().invoke({}, config={"recursion_limit": recursion_limit})
-    finally:
+    except Exception:
         runner.close()
-    run_log = final_state["run_log"]
+        raise
+    return final_state, runner
+
+
+def run_multi_stage_workflow(args: argparse.Namespace, stages: list[WorkflowStage], *, mcp_client: MCPClient | Any | None = None) -> dict[str, Any]:
+    shared_client = mcp_client
+    owns_client = False
+    if shared_client is None:
+        shared_client = MCPClient(MCP_SERVER, MCP_TIMEOUT_SECONDS)
+        shared_client.initialize()
+        owns_client = True
+
+    artifact_dir = legacy.workflow_run_artifact_dir(args.plan_output, cwd=Path.cwd()) if args.plan_output else None
+    run_log: dict[str, Any] = {
+        "instruction": args.instruction,
+        "execute": args.execute,
+        "workflow_type": "multi_stage",
+        "artifact_dir": os.fspath(artifact_dir) if artifact_dir else None,
+        "plan_output": os.fspath(args.plan_output) if args.plan_output else None,
+        "started_at": time.time(),
+        "stages": [],
+        "final_status": "running",
+    }
+    share_text: str | None = None
+
+    try:
+        for index, stage in enumerate(stages, start=1):
+            stage_args = copy.deepcopy(args)
+            if share_text and "{{shared_payload}}" in stage.instruction:
+                stage_args.instruction = stage.instruction.replace("{{shared_payload}}", share_text)
+            elif share_text and stage.metadata.get("recipient") and index == len(stages):
+                stage_args.instruction = (
+                    f"打开目标发送应用，给好友“{stage.metadata.get('recipient', '')}”发送以下消息。"
+                    "不要改写，不要截断，发送后再结束：\n"
+                    f"{share_text}"
+                )
+            else:
+                stage_args.instruction = stage.instruction
+            stage_args.target = stage.target
+            stage_args.plan_output = _stage_output_path(args.plan_output, index, stage.name)
+            stage_args.traversal_output = _stage_output_path(args.traversal_output, index, stage.name)
+            final_state, runner = run_single_workflow_state(stage_args, mcp_client=shared_client)
+            try:
+                stage_run_log = final_state["run_log"]
+                stage_record = {
+                    "name": stage.name,
+                    "target": stage.target,
+                    "instruction": stage_args.instruction,
+                    "final_status": stage_run_log.get("final_status"),
+                    "plan_output": stage_run_log.get("plan_output"),
+                    "artifact_dir": stage_run_log.get("artifact_dir"),
+                    "llm_call_dir": stage_run_log.get("llm_call_dir"),
+                    "workflow_mode": stage_run_log.get("workflow_mode"),
+                    "app_profile": stage_run_log.get("app_profile"),
+                    "stage_max_steps_hint": stage.metadata.get("max_steps"),
+                    "effective_max_steps": stage_args.max_steps,
+                    "stage_log": stage_run_log,
+                }
+                if stage.expects_share_text:
+                    share_text = runner.extract_share_text(final_state)
+                    stage_record["extracted_share_text_preview"] = legacy.clean_text(share_text, limit=240) if share_text else None
+                    if not share_text:
+                        stage_record["final_status"] = "blocked"
+                        run_log["stages"].append(stage_record)
+                        run_log["final_status"] = "blocked"
+                        break
+                run_log["stages"].append(stage_record)
+                if stage_record["final_status"] not in {"finished", "dry_run"}:
+                    run_log["final_status"] = stage_record["final_status"] or "blocked"
+                    break
+            finally:
+                runner.close()
+        else:
+            run_log["final_status"] = "dry_run" if not args.execute else "finished"
+    finally:
+        run_log["completed_at"] = time.time()
+        if owns_client and shared_client is not None:
+            shared_client.close()
     if args.plan_output:
         legacy.write_json(args.plan_output, run_log)
     return run_log
+
+
+def run_workflow(args: argparse.Namespace, *, mcp_client: MCPClient | Any | None = None) -> dict[str, Any]:
+    shared_client = mcp_client
+    owns_client = False
+    if shared_client is None:
+        shared_client = MCPClient(MCP_SERVER, MCP_TIMEOUT_SECONDS)
+        shared_client.initialize()
+        owns_client = True
+    artifact_dir = legacy.workflow_run_artifact_dir(args.plan_output, cwd=Path.cwd()) if args.plan_output else None
+    try:
+        stage_plan = plan_task_stages(args, shared_client, artifact_dir=artifact_dir)
+        if stage_plan:
+            return run_multi_stage_workflow(args, stage_plan, mcp_client=shared_client)
+        final_state, runner = run_single_workflow_state(args, mcp_client=shared_client)
+        run_log = final_state["run_log"]
+        try:
+            if args.plan_output:
+                legacy.write_json(args.plan_output, run_log)
+            return run_log
+        finally:
+            runner.close()
+    finally:
+        if owns_client and shared_client is not None:
+            shared_client.close()
 
 
 def main(argv: list[str] | None = None) -> int:
