@@ -2261,7 +2261,7 @@ class LangGraphComputerUseWorkflow:
             f"identifier: {target_identifier})",
             file=sys.stderr,
         )
-        initial_app_state = self.fetch_app_state(target_identifier)
+        initial_app_state = self.fetch_app_state(target_identifier, activation_policy="foreground")
         traversal = self.traversal_from_app_state(initial_app_state)
         pid = int(initial_app_state["pid"])
         app_profile = legacy.resolve_app_profile(target_identifier, target_resolution, traversal)
@@ -3054,13 +3054,14 @@ class LangGraphComputerUseWorkflow:
             }
         )
 
-    def fetch_app_state(self, app: str) -> dict[str, Any]:
+    def fetch_app_state(self, app: str, *, activation_policy: str = "preserve_session") -> dict[str, Any]:
         result = self.mcp.call_tool(
             "get_app_state",
             {
                 "app": app,
                 "observation_mode": "ax_ocr",
                 "summary_mode": "metadata",
+                "activation_policy": activation_policy,
             },
         )
         text = _content_text(result)
