@@ -199,8 +199,12 @@ Tactile is built on decades of work from accessibility communities, screen reade
 We are grateful to everyone who has helped make software more readable, operable, and adaptable. Tactile hopes to connect that work with the agent era, and to make the same semantic infrastructure useful to both humans and AI.
 
 
-## Join Us
-
-If you care about Agentic AI, desktop automation, operating systems, accessibility technology, or simply believe software should be easier for both agents and humans to use, you are welcome to join Tactile.
-
-**Accessible to humans. Operable by agents.**
+## Citation
+```
+@article{liu2026tactile,
+  title={Tactile: Giving Computer-Using Agents Hands and Feet},
+  author={Liu, Yong and Zhong, Zhenyi and Shi, Zhanpeng},
+  journal={arXiv preprint arXiv:2607.14443},
+  year={2026}
+}
+```
